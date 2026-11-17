@@ -1,0 +1,33 @@
+# ProofLens Baseline Experiment Configuration (Prepared for Phase 1+)
+# NOTE: No training is executed during Phase 0.
+experiment:
+  name: "baseline_benchmark"
+  phase: 1
+  seed: 42
+  output_dir: "outputs/baseline"
+
+data:
+  config_path: "configs/data.yaml"
+  image_size: 224
+  batch_size: 64
+  num_workers: 4
+  pin_memory: true
+
+models:
+  planned_architectures:
+    - "resnet50"
+    - "densenet121"
+    - "mobilenet_v3_large"
+    - "convnext_tiny"
+  pretrained: true
+  num_classes: 2
+  dropout: 0.2
+
+training:
+  epochs: 20
+  optimizer: "adamw"
+  learning_rate: 0.0001
+  weight_decay: 0.01
+  scheduler: "cosine"
+  mixed_precision: true
+  early_stopping_patience: 5

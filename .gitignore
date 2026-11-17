@@ -1,0 +1,80 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Raw datasets, archives, and processed image outputs
+data/raw/
+data/processed/*
+!data/processed/.gitkeep
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
+
+# Generated images and plots (except tracked report figures if explicitly committed, though raw images are excluded)
+*.bmp
+*.tiff
+*.webp
+
+# Checkpoints and model weights
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.safetensors
+checkpoints/
+
+# Experiment outputs and logs
+outputs/*
+!outputs/.gitkeep
+wandb/
+mlruns/
+lightning_logs/
+runs/
+
+# Secrets and credentials
+.env
+.env.*
+kaggle.json
+*credentials*.json
+*secret*
+
+# Python caches and packaging artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Testing and tooling caches
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# OS and IDE files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.tmp

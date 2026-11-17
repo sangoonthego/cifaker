@@ -1,0 +1,65 @@
+# ProofLens Dataset Configuration (Phase 0 & Future Phases)
+dataset:
+  name: "tiny_genimage"
+  kaggle_id: "yangsangtai/tiny-genimage"
+  expected_version: 1
+  license: "CC BY-NC-SA 4.0"
+  raw_dir: "data/raw/tiny_genimage"
+  processed_dir: "data/processed"
+  manifest_path: "data/manifests/images.csv"
+  summary_path: "data/manifests/dataset_summary.json"
+  audit_report_path: "reports/phase0_dataset_audit.md"
+  figures_dir: "reports/figures"
+
+# Explicit folder-to-label mappings
+# Standard binary labels: REAL = 0, FAKE = 1
+# Any folder name not listed here will NOT be guessed; it will be flagged as UNKNOWN (-1)
+label_mapping:
+  nature:
+    label: 0
+    label_name: "REAL"
+  ai:
+    label: 1
+    label_name: "FAKE"
+
+# Explicit split folder mappings
+split_mapping:
+  train: "train"
+  val: "val"
+  test: "test"
+
+# Explicit generator directory mappings to canonical generator identifiers
+generator_mapping:
+  imagenet_ai_0419_biggan: "biggan"
+  imagenet_ai_0419_vqdm: "vqdm"
+  imagenet_ai_0424_sdv5: "sdv5"
+  imagenet_ai_0424_wukong: "wukong"
+  imagenet_ai_0508_adm: "adm"
+  imagenet_glide: "glide"
+  imagenet_midjourney: "midjourney"
+
+# Supported image extensions for discovery (case-insensitive)
+supported_extensions:
+  - ".png"
+  - ".jpg"
+  - ".jpeg"
+  - ".webp"
+  - ".bmp"
+  - ".tiff"
+  - ".tif"
+
+# Future cross-generator experimental protocol settings (configured in Phase 0, executed in Phase 1+)
+protocols:
+  in_domain:
+    description: "Train and validate across all 7 generators using source splits (after duplicate/leakage filtering)."
+    train_generators: ["adm", "biggan", "glide", "midjourney", "sdv5", "vqdm", "wukong"]
+    eval_generators: ["adm", "biggan", "glide", "midjourney", "sdv5", "vqdm", "wukong"]
+  leave_one_generator_out:
+    description: "Train on a subset of generators and evaluate zero-shot generalization on unseen generators."
+    holdout_candidates:
+      - name: "holdout_midjourney"
+        train_generators: ["adm", "biggan", "glide", "sdv5", "vqdm", "wukong"]
+        unseen_generators: ["midjourney"]
+      - name: "holdout_gan_vs_diffusion"
+        train_generators: ["adm", "glide", "midjourney", "sdv5", "vqdm", "wukong"]
+        unseen_generators: ["biggan"]

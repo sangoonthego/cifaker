@@ -1,0 +1,26 @@
+# ProofLens Smoke Test Configuration (Prepared for Phase 1+)
+# NOTE: No training is executed during Phase 0.
+experiment:
+  name: "smoke_test"
+  phase: 1
+  seed: 42
+  output_dir: "outputs/smoke"
+
+data:
+  config_path: "configs/data.yaml"
+  image_size: 224
+  batch_size: 8
+  num_workers: 0
+  max_samples_per_split: 32
+
+models:
+  planned_architectures:
+    - "mobilenet_v3_large"
+  pretrained: false
+  num_classes: 2
+
+training:
+  epochs: 1
+  optimizer: "adamw"
+  learning_rate: 0.001
+  mixed_precision: false
