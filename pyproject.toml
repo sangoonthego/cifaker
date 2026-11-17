@@ -18,13 +18,17 @@ dependencies = [
     "Pillow>=10.0.0,<12.0.0",
     "PyYAML>=6.0.1,<7.0.0",
     "matplotlib>=3.8.0,<4.0.0",
-    "kaggle>=1.6.0,<2.0.0",
+    "scikit-learn>=1.4.0,<2.0.0",
+    "scipy>=1.11.0,<2.0.0",
+    "torch>=2.2.0",
+    "torchvision>=0.17.0",
     "tqdm>=4.66.0,<5.0.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0.0,<9.0.0",
+    "ruff>=0.4.0,<1.0.0",
 ]
 
 [tool.setuptools.packages.find]
@@ -33,4 +37,17 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
-addopts = "-q"
+addopts = "-q --basetemp=.pytest_cache/tmp"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["src", "scripts", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"

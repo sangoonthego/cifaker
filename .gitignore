@@ -3,8 +3,11 @@
 venv/
 env/
 
-# Raw datasets, archives, and processed image outputs
+# Raw datasets, synthetic fixtures, archives, and processed image outputs
 data/raw/
+data/fixtures/
+data/manifests/*
+!data/manifests/.gitkeep
 data/processed/*
 !data/processed/.gitkeep
 *.zip
@@ -14,21 +17,23 @@ data/processed/*
 *.7z
 *.rar
 
-# Generated images and plots (except tracked report figures if explicitly committed, though raw images are excluded)
+# Generated images and plots
 *.bmp
 *.tiff
 *.webp
 
-# Checkpoints and model weights
+# Checkpoints, artifacts, and model weights
 *.pt
 *.pth
 *.ckpt
 *.onnx
 *.safetensors
 checkpoints/
+artifacts/
+!artifacts/.gitkeep
 
 # Experiment outputs and logs
-outputs/*
+outputs/
 !outputs/.gitkeep
 wandb/
 mlruns/
