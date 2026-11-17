@@ -1,0 +1,24 @@
+# Kaggle GPU Execution Template Configuration (Deferred to Phase 0B / Phase 1)
+experiment:
+  name: "kaggle_baseline_template"
+  seed: 42
+  environment: "kaggle"
+
+dataset:
+  root: "/kaggle/input/tiny-genimage"
+  manifest: "/kaggle/working/manifests/images.csv"
+  image_size: 224
+
+model:
+  name: "resnet50"
+  pretrained: true
+  num_classes: 1
+
+training:
+  device: "cuda"
+  batch_size: 64
+  max_batches: 500
+  learning_rate: 0.0001
+
+output:
+  directory: "/kaggle/working/outputs/baseline"

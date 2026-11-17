@@ -1,0 +1,18 @@
+# Planned CNN Model Configurations (Phase 0A Contract: num_classes = 1 logit)
+models:
+  resnet50:
+    name: "resnet50"
+    pretrained: false
+    num_classes: 1
+  densenet121:
+    name: "densenet121"
+    pretrained: false
+    num_classes: 1
+  mobilenetv3_large:
+    name: "mobilenetv3_large"
+    pretrained: false
+    num_classes: 1
+  convnext_tiny:
+    name: "convnext_tiny"
+    pretrained: false
+    num_classes: 1
