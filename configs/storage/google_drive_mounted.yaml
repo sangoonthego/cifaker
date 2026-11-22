@@ -1,0 +1,12 @@
+# Mounted Google Drive Storage Configuration (Colab drive.mount FUSE)
+# Uses staged copy + fsync + explicit read-back SHA-256 verification.
+storage:
+  backend: "google_drive"
+  gdrive_mode: "mounted"
+  gdrive_folder_name: "cifaker"
+  gdrive_folder_id: "1IipfeWX_OVJS2KwaFL5wFlO-edxLoEGD"
+  gdrive_mount_root: "/content/drive/MyDrive/cifaker"
+  max_retries: 3
+  retry_backoff_seconds: 1.0
+  verify_after_upload: true
+  single_writer_lock: true

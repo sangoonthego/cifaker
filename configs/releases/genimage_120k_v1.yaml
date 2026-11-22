@@ -1,0 +1,20 @@
+# Release Configuration: genimage-120k-v1 (Initial 120K Release)
+# Target Quotas: 80K train + 10K dev + 10K seen_test + 20K unseen_test = 120,000 images
+release_id: "genimage-120k-v1"
+sampling_seed: 20260401
+parent_release_id: null
+description: "Initial 120K cross-generator release (80K train, 40K frozen evaluation suite)."
+
+source_config: "../sources/genimage_full_archives.yaml"
+protocol_config: "../protocols/cross_generator_v1.yaml"
+storage_config: "../storage/google_drive_api.yaml"
+
+# ~1.5 GiB uncompressed TAR shard target
+shard_target_bytes: 1610612736
+materialization_workers: 4
+materialization_batch_size: 256
+source_max_retries: 3
+compute_pixel_hash: false
+compute_perceptual_hash: true
+inventory_batch_size: 5000
+working_dir: "artifacts/pipeline_work"

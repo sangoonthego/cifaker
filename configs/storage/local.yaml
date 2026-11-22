@@ -1,0 +1,6 @@
+# Local Filesystem Storage Configuration (Development & Offline Tests)
+storage:
+  backend: "local"
+  root_path: "data/storage"
+  verify_after_upload: true
+  single_writer_lock: true

@@ -193,7 +193,26 @@ All model evaluation tables follow the standard schema:
 
 ---
 
-## 7. Kaggle Integration Strategy & Four-Member Team Workflow
+## 7. Scalable GenImage Dataset Pipeline (120K → 200K → 500K+)
+
+ProofLens includes a production-oriented, versioned dataset engineering pipeline under `src/prooflens/data/` designed to build, verify, publish, scale, and consume immutable TAR-sharded GenImage releases via Google Colab and Google Drive (`cifaker`):
+
+- **Source Adapters (`src/prooflens/data/sources/`):** Directory trees, ZIP/TAR/TAR.GZ archives with shard-aware streaming, and revision-pinned Hugging Face datasets.
+- **Canonical Registry & Duplicate Control (`src/prooflens/data/registry/`):** Bounded-memory Parquet inventory, strict REAL provenance separation (`generator="none"` vs `source_generator_group`), exact SHA-256 / pixel hash / Multi-Index Band LSH perceptual dHash candidate detection.
+- **Deterministic Nested Sampling (`src/prooflens/data/sampling/`):** Guarantees `Train(120K) ⊆ Train(200K) ⊆ Train(500K)` with frozen `dev`, `seen_test`, and `unseen_test` splits and strict leakage boundary guards.
+- **Incremental Materialization & Immutable Shards (`src/prooflens/data/processing/`):** Preserves original image bytes in verified uncompressed TAR shards, reuses parent release shards on expansion, and resumes cleanly from committed receipts.
+- **Storage & Release Management (`src/prooflens/data/storage/`, `src/prooflens/data/releases/`):** Replaceable storage backends (`LocalFilesystemStorage`, `GoogleDriveStorage` in `api` or `mounted` mode), metadata-last publication (`release.json`), and a read-only consumer API (`load_release(...)`) backed by `ShardMapDataset` / `ShardIterableDataset` and local/bounded LRU shard caches.
+
+```bash
+python -m prooflens.data.cli --help
+python -m prooflens.data.cli plan --config configs/releases/genimage_120k_v1.yaml --dry-run
+```
+
+For full architecture, configuration schemas, exact CLI usage, Colab execution workflow, and known limitations, see **[docs/SCALABLE_DATA_PIPELINE.md](docs/SCALABLE_DATA_PIPELINE.md)**.
+
+---
+
+## 8. Kaggle Integration Strategy & Four-Member Team Workflow
 
 ### Packaging for Kaggle
 When moving from local development to Kaggle Notebooks (`notebooks/kaggle_runner.ipynb`):
@@ -205,7 +224,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for detailed module ownership across Memb
 
 ---
 
-## 8. Research Roadmap
+## 9. Research Roadmap
 
 - **Phase 0A (Current — COMPLETE):** Local engineering foundation, contracts, synthetic fixtures, CPU smoke testing, and GitHub CI.
 - **Phase 0B (Next):** Full Tiny GenImage dataset audit, SHA-256 duplicate & cross-split leakage analysis, and format/resolution confounding report executed directly on Kaggle.

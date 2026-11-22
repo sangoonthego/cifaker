@@ -1,0 +1,12 @@
+# Google Drive API v3 Storage Configuration (Colab Interactive OAuth / ADC)
+# Target shared team folder: cifaker
+# Never store OAuth tokens or service-account secrets in this file.
+storage:
+  backend: "google_drive"
+  gdrive_mode: "api"
+  gdrive_folder_name: "cifaker"
+  gdrive_folder_id: "1IipfeWX_OVJS2KwaFL5wFlO-edxLoEGD"
+  max_retries: 4
+  retry_backoff_seconds: 1.5
+  verify_after_upload: true
+  single_writer_lock: true
