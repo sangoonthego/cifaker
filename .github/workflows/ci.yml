@@ -29,9 +29,10 @@ jobs:
           python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
           python -m pip install -e ".[dev]"
 
-      - name: Verify package import
+      - name: Verify package import and pipeline CLI
         run: |
           python -c "import prooflens; print('ProofLens import OK')"
+          python -m prooflens.data.cli --help
 
       - name: Run Ruff linter
         run: |
