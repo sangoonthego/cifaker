@@ -3,19 +3,25 @@
 venv/
 env/
 
-# Raw datasets, synthetic fixtures, archives, and processed image outputs
+# Raw datasets, synthetic fixtures, archives, shards, caches, and processed image outputs
 data/raw/
 data/fixtures/
+data/releases/
+data/storage/
+data/cache/
 data/manifests/*
 !data/manifests/.gitkeep
 data/processed/*
 !data/processed/.gitkeep
+prooflens_cache/
 *.zip
 *.tar
 *.tar.gz
 *.tgz
 *.7z
 *.rar
+*.parquet
+*.tar.tmp
 
 # Generated images and plots
 *.bmp
@@ -44,6 +50,7 @@ runs/
 .env
 .env.*
 kaggle.json
+token.json
 *credentials*.json
 *secret*
 

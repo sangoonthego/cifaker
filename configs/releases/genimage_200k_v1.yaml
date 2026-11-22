@@ -1,0 +1,27 @@
+# Release Configuration: genimage-200k-v1 (Nested Expansion from 120K -> 200K)
+# Invariants:
+# - Train(120K) ⊆ Train(200K) (80K -> 160K train)
+# - Dev, Seen-Test, and Unseen-Test remain identically frozen (40K total)
+# - All committed parent shards from genimage-120k-v1 are reused without re-materialization
+release_id: "genimage-200k-v1"
+sampling_seed: 20260401
+parent_release_id: "genimage-120k-v1"
+description: "Nested 200K expansion reusing all 120K shards and adding 80K delta train images."
+
+source_config: "../sources/genimage_full_archives.yaml"
+protocol_config: "../protocols/cross_generator_v1.yaml"
+storage_config: "../storage/google_drive_api.yaml"
+
+split_quotas:
+  train:
+    real_quota: 80000
+    fake_quota: 80000
+
+shard_target_bytes: 1610612736
+materialization_workers: 4
+materialization_batch_size: 256
+source_max_retries: 3
+compute_pixel_hash: false
+compute_perceptual_hash: true
+inventory_batch_size: 5000
+working_dir: "artifacts/pipeline_work"

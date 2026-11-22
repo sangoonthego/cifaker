@@ -1,0 +1,56 @@
+# ProofLens Cross-Generator Experimental Protocol v1
+# Enforces:
+# - Unseen generators excluded from `train` and `dev`.
+# - `dev` drawn from upstream `train` (disjoint from `train`), never from upstream `val`.
+# - `seen_test` and `unseen_test` drawn exclusively from upstream `val` / `test`.
+# - Frozen 40K evaluation suite across scaling releases (120K -> 200K -> 500K).
+protocol:
+  protocol_version: "cross_generator_v1"
+  seen_generators:
+    - "adm"
+    - "biggan"
+    - "glide"
+    - "sdv4"
+    - "sdv5"
+    - "vqdm"
+  unseen_generators:
+    - "midjourney"
+    - "wukong"
+  group_quota_policy: "exact_or_fail"
+  cross_source_split_leakage_policy: "fail"
+  deduplicate_within_group: true
+  include_perceptual_in_leakage_groups: false
+  perceptual_hamming_threshold: 4
+  splits:
+    train:
+      allowed_source_splits: ["train"]
+      generator_pool: "seen"
+      frozen_across_scaling: false
+      real_quota: 40000
+      fake_quota: 40000
+      stratify_by_generator_group: true
+      stratify_by_imagenet_class: false
+    dev:
+      allowed_source_splits: ["train"]
+      generator_pool: "seen"
+      frozen_across_scaling: true
+      real_quota: 5000
+      fake_quota: 5000
+      stratify_by_generator_group: true
+      stratify_by_imagenet_class: false
+    seen_test:
+      allowed_source_splits: ["val", "test"]
+      generator_pool: "seen"
+      frozen_across_scaling: true
+      real_quota: 5000
+      fake_quota: 5000
+      stratify_by_generator_group: true
+      stratify_by_imagenet_class: false
+    unseen_test:
+      allowed_source_splits: ["val", "test"]
+      generator_pool: "unseen"
+      frozen_across_scaling: true
+      real_quota: 10000
+      fake_quota: 10000
+      stratify_by_generator_group: true
+      stratify_by_imagenet_class: false

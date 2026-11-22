@@ -1,0 +1,38 @@
+# Full GenImage Archive Source Configuration (Colab / Mounted Archive Directory)
+# NOTE: Replace `location` via --source-override or environment mount path on Colab.
+# Never embed credentials in YAML files.
+source:
+  source_id: "genimage_full_archives"
+  source_type: "archive"
+  source_revision: "genimage-official-v1"
+  location: "/content/genimage_archives"
+  archive_glob: "*.zip"
+  real_generator_value: "none"
+  strict_generator_mapping: false
+  label_mapping:
+    nature: 0
+    real: 0
+    ai: 1
+    fake: 1
+  split_mapping:
+    train: "train"
+    val: "val"
+    valid: "val"
+    test: "test"
+  generator_mapping:
+    imagenet_ai_0419_biggan: "biggan"
+    imagenet_ai_0419_vqdm: "vqdm"
+    imagenet_ai_0424_sdv4: "sdv4"
+    imagenet_ai_0424_sdv5: "sdv5"
+    imagenet_ai_0424_wukong: "wukong"
+    imagenet_ai_0508_adm: "adm"
+    imagenet_glide: "glide"
+    imagenet_midjourney: "midjourney"
+  supported_extensions:
+    - ".png"
+    - ".jpg"
+    - ".jpeg"
+    - ".webp"
+    - ".bmp"
+    - ".tiff"
+    - ".tif"

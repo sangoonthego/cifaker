@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "prooflens"
-version = "0.1.0"
+version = "0.2.0"
 description = "ProofLens: Research and Development of an AI-Generated Image Detection Model"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -15,9 +15,15 @@ authors = [
 dependencies = [
     "numpy>=1.26.0,<3.0.0",
     "pandas>=2.1.0,<3.0.0",
+    "pyarrow>=15.0.0,<28.0.0",
     "Pillow>=10.0.0,<12.0.0",
     "PyYAML>=6.0.1,<7.0.0",
     "matplotlib>=3.8.0,<4.0.0",
+    "requests>=2.31.0,<3.0.0",
+    "google-api-python-client>=2.120.0",
+    "google-auth>=2.28.0",
+    "google-auth-httplib2>=0.2.0",
+    "google-auth-oauthlib>=1.2.0",
     "scikit-learn>=1.4.0,<2.0.0",
     "scipy>=1.11.0,<2.0.0",
     "torch>=2.2.0",
@@ -30,6 +36,18 @@ dev = [
     "pytest>=8.0.0,<9.0.0",
     "ruff>=0.4.0,<1.0.0",
 ]
+gdrive = [
+    "google-api-python-client>=2.120.0",
+    "google-auth>=2.28.0",
+    "google-auth-oauthlib>=1.2.0",
+]
+hf = [
+    "datasets>=2.18.0",
+    "huggingface-hub>=0.22.0",
+]
+
+[project.scripts]
+prooflens-data = "prooflens.data.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -43,6 +61,7 @@ addopts = "-q --basetemp=.pytest_cache/tmp"
 target-version = "py311"
 line-length = 100
 src = ["src", "scripts", "tests"]
+extend-exclude = ["notebooks/ProofLens_Phase0B.ipynb"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP"]
