@@ -100,6 +100,61 @@ def _detect_git_commit() -> str | None:
         return None
 
 
+def _extract_sampling_code_commit(
+    freeze_meta: dict[str, Any],
+    plan_meta: dict[str, Any],
+) -> tuple[str | None, str | None]:
+    """Extract sampling commit SHA from frozen metadata with legacy alias support.
+
+    Precedence order:
+    1. `freeze.json`: `sampling_code_commit`
+    2. `freeze.json`: `code_commit` (legacy Colab freeze format)
+    3. `freeze.json`: `code_commit_sha`
+    4. `freeze.json`: `git_commit`
+    5. `plan.json`: `code_commit_sha`
+
+    Returns `(commit_sha, source_field)` where both are `None` if no non-empty commit
+    metadata is recorded. Raises `FrozenSnapshotError` if two or more populated aliases
+    declare conflicting non-empty commit values so contradictory provenance is never
+    silently ignored or rewritten.
+    """
+    candidates: tuple[tuple[str, Any], ...] = (
+        ("freeze.json:sampling_code_commit", freeze_meta.get("sampling_code_commit")),
+        ("freeze.json:code_commit", freeze_meta.get("code_commit")),
+        ("freeze.json:code_commit_sha", freeze_meta.get("code_commit_sha")),
+        ("freeze.json:git_commit", freeze_meta.get("git_commit")),
+        ("plan.json:code_commit_sha", plan_meta.get("code_commit_sha")),
+    )
+
+    populated: list[tuple[str, str]] = []
+    for field_name, raw_val in candidates:
+        if raw_val is None:
+            continue
+        if not isinstance(raw_val, str):
+            raise FrozenSnapshotError(
+                f"Invalid sampling commit value in '{field_name}': "
+                f"expected string or null, got {type(raw_val).__name__}."
+            )
+        cleaned = raw_val.strip()
+        if cleaned:
+            populated.append((field_name, cleaned))
+
+    if not populated:
+        return None, None
+
+    distinct_values = {val for _, val in populated}
+    if len(distinct_values) > 1:
+        conflict_detail = ", ".join(f"{name}={val!r}" for name, val in populated)
+        raise FrozenSnapshotError(
+            f"Conflicting non-empty sampling commit aliases detected in frozen snapshot: "
+            f"{conflict_detail}. Resolve provenance ambiguity explicitly without rewriting "
+            f"historical snapshot artifacts silently."
+        )
+
+    source_field, commit_sha = populated[0]
+    return commit_sha, source_field
+
+
 def _extract_expected_artifact_digests(
     freeze_meta: dict[str, Any],
 ) -> dict[str, dict[str, Any]]:
@@ -509,11 +564,8 @@ def load_and_validate_frozen_snapshot(
             f"Expected Plan ID '{expected_plan_id}', found '{recorded_plan_id}'."
         )
 
-    sampling_code_commit = (
-        freeze_meta.get("sampling_code_commit")
-        or freeze_meta.get("code_commit_sha")
-        or freeze_meta.get("git_commit")
-        or plan_meta.get("code_commit_sha")
+    sampling_code_commit, sampling_commit_source = _extract_sampling_code_commit(
+        freeze_meta, plan_meta
     )
 
     sampling_provenance = {
@@ -542,6 +594,7 @@ def load_and_validate_frozen_snapshot(
         "leakage_check": leakage.to_dict(),
         "plan_id_verified": True,
         "arrow_locators_verified": bool(verify_arrow_locators and is_arrow_selection),
+        "sampling_code_commit_source": sampling_commit_source,
     }
 
     return FrozenSnapshot(

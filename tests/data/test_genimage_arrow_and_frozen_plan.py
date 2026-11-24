@@ -840,6 +840,181 @@ def test_near_duplicate_quality_gate_blocks_or_warns_without_dropping(tmp_path: 
     assert any("perceptual dHash" in w for w in ver_warn.warnings)
 
 
+def test_legacy_and_modern_sampling_commit_provenance_extraction_and_propagation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression suite for Phase 2.2 legacy `code_commit` provenance extraction & propagation."""
+    fx = _build_synthetic_arrow_fixture_and_snapshot(tmp_path)
+    base_snap_dir: Path = fx["snap_dir"]
+    mat_cfg: ReleaseConfig = fx["mat_cfg"]
+    legacy_sha = "d76c8fd6105bfef029bcb2b8dbead255bf03ff5c"
+
+    def _clone_snapshot(
+        name: str,
+        freeze_updates: dict[str, Any],
+        plan_updates: dict[str, Any] | None = None,
+    ) -> Path:
+        dst = tmp_path / name
+        dst.mkdir(parents=True, exist_ok=True)
+        for p in base_snap_dir.iterdir():
+            (dst / p.name).write_bytes(p.read_bytes())
+
+        f_meta = json.loads((dst / "freeze.json").read_text(encoding="utf-8"))
+        for key in ("sampling_code_commit", "code_commit", "code_commit_sha", "git_commit"):
+            f_meta.pop(key, None)
+        f_meta.update(freeze_updates)
+
+        if plan_updates is not None:
+            p_meta = json.loads((dst / "plan.json").read_text(encoding="utf-8"))
+            p_meta.update(plan_updates)
+            plan_path = dst / "plan.json"
+            plan_path.write_text(json.dumps(p_meta, indent=2), encoding="utf-8")
+            f_meta["artifacts"]["plan.json"] = {
+                "sha256": compute_file_sha256(plan_path),
+                "size_bytes": plan_path.stat().st_size,
+            }
+
+        (dst / "freeze.json").write_text(json.dumps(f_meta, indent=2), encoding="utf-8")
+        return dst
+
+    # 1. Legacy snapshot containing only `code_commit` in freeze.json (exact Colab freeze layout)
+    legacy_snap_dir = _clone_snapshot("snap_legacy_code_commit", {"code_commit": legacy_sha})
+    legacy_freeze_bytes_before = (legacy_snap_dir / "freeze.json").read_bytes()
+    legacy_snap = load_and_validate_frozen_snapshot(legacy_snap_dir, expected_total_records=40)
+    assert legacy_snap.sampling_provenance["sampling_code_commit"] == legacy_sha
+    assert legacy_snap.validation_report["sampling_code_commit_source"] == "freeze.json:code_commit"
+    assert legacy_snap.sampling_provenance["sampling_plan_id"] == fx["plan"].plan_id
+    assert legacy_snap.sampling_provenance["sampling_config_hash"] == fx["sampling_cfg"].config_hash
+    assert (legacy_snap_dir / "freeze.json").read_bytes() == legacy_freeze_bytes_before
+
+    # 2. Modern snapshot containing `sampling_code_commit` (and matching legacy alias -> precedence kept)
+    modern_sha = "1111111111111111111111111111111111111111"
+    modern_dir = _clone_snapshot(
+        "snap_modern",
+        {"sampling_code_commit": modern_sha, "code_commit": modern_sha},
+    )
+    modern_snap = load_and_validate_frozen_snapshot(modern_dir, expected_total_records=40)
+    assert modern_snap.sampling_provenance["sampling_code_commit"] == modern_sha
+    assert (
+        modern_snap.validation_report["sampling_code_commit_source"]
+        == "freeze.json:sampling_code_commit"
+    )
+
+    # Blank/whitespace higher-priority alias falls back cleanly to legacy `code_commit`
+    whitespace_fallback_dir = _clone_snapshot(
+        "snap_ws_fallback",
+        {"sampling_code_commit": "   ", "code_commit": f"  {legacy_sha}  "},
+    )
+    ws_snap = load_and_validate_frozen_snapshot(whitespace_fallback_dir, expected_total_records=40)
+    assert ws_snap.sampling_provenance["sampling_code_commit"] == legacy_sha
+    assert ws_snap.validation_report["sampling_code_commit_source"] == "freeze.json:code_commit"
+
+    # 3. Existing supported aliases: freeze.json code_commit_sha, git_commit, and plan.json code_commit_sha
+    alias_cases = [
+        (
+            "snap_alias_sha",
+            {"code_commit_sha": "2" * 40},
+            None,
+            "2" * 40,
+            "freeze.json:code_commit_sha",
+        ),
+        ("snap_alias_git", {"git_commit": "3" * 40}, None, "3" * 40, "freeze.json:git_commit"),
+        (
+            "snap_alias_plan",
+            {},
+            {"code_commit_sha": "4" * 40},
+            "4" * 40,
+            "plan.json:code_commit_sha",
+        ),
+    ]
+    for case_name, f_upd, p_upd, exp_sha, exp_src in alias_cases:
+        c_dir = _clone_snapshot(case_name, f_upd, p_upd)
+        c_snap = load_and_validate_frozen_snapshot(c_dir, expected_total_records=40)
+        assert c_snap.sampling_provenance["sampling_code_commit"] == exp_sha
+        assert c_snap.validation_report["sampling_code_commit_source"] == exp_src
+
+    # 4. Missing sampling commit metadata -> None without failing validation
+    missing_dir = _clone_snapshot("snap_missing_commit", {})
+    missing_snap = load_and_validate_frozen_snapshot(missing_dir, expected_total_records=40)
+    assert missing_snap.sampling_provenance["sampling_code_commit"] is None
+    assert missing_snap.validation_report["sampling_code_commit_source"] is None
+
+    # 4b. Conflicting non-empty commit aliases MUST fail safely without silent rewrite
+    conflict_freeze_dir = _clone_snapshot(
+        "snap_conflict_freeze",
+        {"sampling_code_commit": "a" * 40, "code_commit": "b" * 40},
+    )
+    with pytest.raises(FrozenSnapshotError, match="Conflicting non-empty sampling commit aliases"):
+        load_and_validate_frozen_snapshot(conflict_freeze_dir, expected_total_records=40)
+
+    conflict_cross_file_dir = _clone_snapshot(
+        "snap_conflict_cross_file",
+        {"code_commit": "a" * 40},
+        {"code_commit_sha": "b" * 40},
+    )
+    with pytest.raises(FrozenSnapshotError, match="Conflicting non-empty sampling commit aliases"):
+        load_and_validate_frozen_snapshot(conflict_cross_file_dir, expected_total_records=40)
+
+    # 5. Downstream propagation of legacy `code_commit` into compatibility, pilot, build & publish artifacts
+    def _forbid_resampling(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("plan_release() MUST NOT be called during frozen build!")
+
+    monkeypatch.setattr("prooflens.data.releases.manager.plan_release", _forbid_resampling)
+
+    compat = check_frozen_plan_compatibility(legacy_snap, mat_cfg)
+    assert compat.compatible is True
+    assert compat.sampling_provenance["sampling_code_commit"] == legacy_sha
+
+    from dataclasses import replace
+
+    prop_storage = LocalFilesystemStorage(tmp_path / "legacy_prop_storage")
+    prop_cfg = replace(
+        mat_cfg,
+        storage=StorageConfig(backend="local", root_path=str(prop_storage.root_dir)),
+        working_dir=str(tmp_path / "legacy_prop_work"),
+    )
+    adapter = GenImageArrowAdapter(prop_cfg.source)
+    manager = ReleaseManager(prop_storage)
+
+    # Pilot propagation check
+    pilot_storage = LocalFilesystemStorage(tmp_path / "legacy_pilot_scratch")
+    pilot_report = manager.build_pilot_from_frozen_snapshot(
+        snapshot=legacy_snap_dir,
+        adapter=adapter,
+        config=prop_cfg,
+        pilot_storage=pilot_storage,
+        sample_count=8,
+    )
+    assert pilot_report["passed"] is True
+    assert pilot_report["sampling_provenance"]["sampling_code_commit"] == legacy_sha
+
+    # Full frozen build + publish propagation check
+    mat_res, build_compat = manager.build_from_frozen_snapshot(
+        snapshot=legacy_snap_dir,
+        adapter=adapter,
+        config=prop_cfg,
+        strict_frozen_mode=True,
+    )
+    assert len(mat_res.manifest_df) == 40
+    assert build_compat.sampling_provenance["sampling_code_commit"] == legacy_sha
+
+    prefix = f"releases/{prop_cfg.release_id}"
+    mat_prov_doc = json.loads(
+        prop_storage.read_bytes(f"{prefix}/materialization_provenance.json").decode("utf-8")
+    )
+    audit_doc = json.loads(prop_storage.read_bytes(f"{prefix}/audit_summary.json").decode("utf-8"))
+    pub_doc = manager.publish(prop_cfg.release_id, verify_tar_members=True)
+
+    assert mat_prov_doc["sampling_provenance"]["sampling_code_commit"] == legacy_sha
+    assert audit_doc["sampling_provenance"]["sampling_code_commit"] == legacy_sha
+    assert pub_doc["sampling_provenance"]["sampling_code_commit"] == legacy_sha
+    assert pub_doc["sampling_plan_id"] == fx["plan"].plan_id
+    assert pub_doc["sampling_config_hash"] == fx["sampling_cfg"].config_hash
+    # Legacy freeze.json remains strictly untouched
+    assert (legacy_snap_dir / "freeze.json").read_bytes() == legacy_freeze_bytes_before
+
+
 def test_production_arrow_yaml_configs_load_cleanly() -> None:
     cfg = load_release_config("configs/releases/genimage_120k_v1_arrow.yaml")
     assert cfg.release_id == "genimage-120k-v1"
