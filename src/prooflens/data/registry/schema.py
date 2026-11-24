@@ -65,6 +65,8 @@ CANONICAL_OPTIONAL_COLUMNS: tuple[str, ...] = (
     "perceptual_hash",
     "decode_status",
     "exclusion_reason",
+    "source_row_index",
+    "original_image_path",
 )
 
 RELEASE_SHARD_COLUMNS: tuple[str, ...] = (
@@ -102,6 +104,8 @@ CANONICAL_ARROW_SCHEMA = pa.schema(
         pa.field("perceptual_hash", pa.string(), nullable=True),
         pa.field("decode_status", pa.string(), nullable=True),
         pa.field("exclusion_reason", pa.string(), nullable=True),
+        pa.field("source_row_index", pa.int64(), nullable=True),
+        pa.field("original_image_path", pa.string(), nullable=True),
     ]
 )
 
@@ -169,6 +173,8 @@ class CanonicalImageRecord:
     perceptual_hash: str | None = None
     decode_status: str | None = None
     exclusion_reason: str | None = None
+    source_row_index: int | None = None
+    original_image_path: str | None = None
 
     def __post_init__(self) -> None:
         if not self.image_id.strip():

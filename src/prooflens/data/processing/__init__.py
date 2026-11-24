@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from prooflens.data.processing.materializer import (
+    FrozenMaterializationError,
+    MaterializationFailureCategory,
     MaterializationResult,
     PlannedShardSpec,
     materialize_release,
@@ -25,7 +27,9 @@ from prooflens.data.processing.validator import (
 
 __all__ = [
     "ByteValidationResult",
+    "FrozenMaterializationError",
     "ImmutableTarShardWriter",
+    "MaterializationFailureCategory",
     "MaterializationResult",
     "PlannedShardSpec",
     "SUPPORTED_IMAGE_EXTENSIONS",

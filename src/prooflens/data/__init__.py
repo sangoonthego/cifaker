@@ -28,6 +28,14 @@ from prooflens.data.manifest import (
     save_manifest_csv,
     validate_manifest_dataframe,
 )
+from prooflens.data.releases.frozen_plan import (
+    CompatibilityReport,
+    FrozenPlanCompatibilityError,
+    FrozenSnapshot,
+    FrozenSnapshotError,
+    check_frozen_plan_compatibility,
+    load_and_validate_frozen_snapshot,
+)
 from prooflens.data.releases.manager import (
     BoundedShardCache,
     FullLocalShardCache,
@@ -37,6 +45,7 @@ from prooflens.data.releases.manager import (
     UnpublishedReleaseError,
     load_release,
 )
+from prooflens.data.releases.preflight import CapacityPreflightReport, run_capacity_preflight
 from prooflens.data.scanner import (
     DEFAULT_LABEL_MAPPING,
     DEFAULT_SPLIT_MAPPING,
@@ -50,11 +59,12 @@ from prooflens.data.shard_dataset import (
     ShardMapDataset,
     create_shard_dataloader,
 )
-from prooflens.data.sources import create_source_adapter
+from prooflens.data.sources import GenImageArrowAdapter, create_source_adapter
 from prooflens.data.storage import (
     GoogleDriveStorage,
     ImmutabilityError,
     LocalFilesystemStorage,
+    StorageCapacityInfo,
     create_storage_backend,
 )
 from prooflens.data.validation import (
@@ -68,12 +78,18 @@ from prooflens.data.validation import (
 __all__ = [
     "ALL_MANIFEST_COLUMNS",
     "BoundedShardCache",
+    "CapacityPreflightReport",
+    "CompatibilityReport",
     "ConfigValidationError",
     "CorruptedShardMemberError",
     "DEFAULT_LABEL_MAPPING",
     "DEFAULT_SPLIT_MAPPING",
     "DEFAULT_SUPPORTED_EXTENSIONS",
+    "FrozenPlanCompatibilityError",
+    "FrozenSnapshot",
+    "FrozenSnapshotError",
     "FullLocalShardCache",
+    "GenImageArrowAdapter",
     "GoogleDriveStorage",
     "ImageIntegrityResult",
     "ImmutabilityError",
@@ -94,16 +110,19 @@ __all__ = [
     "ShardMapDataset",
     "SourceConfig",
     "SplitRuleConfig",
+    "StorageCapacityInfo",
     "StorageConfig",
     "UnpublishedReleaseError",
     "VALID_BINARY_LABELS",
     "build_image_transforms",
+    "check_frozen_plan_compatibility",
     "compute_config_hash",
     "compute_file_sha256",
     "create_dataloader",
     "create_shard_dataloader",
     "create_source_adapter",
     "create_storage_backend",
+    "load_and_validate_frozen_snapshot",
     "load_manifest_csv",
     "load_protocol_config",
     "load_release",
@@ -111,6 +130,7 @@ __all__ = [
     "load_source_config",
     "load_storage_config",
     "parse_relative_image_path",
+    "run_capacity_preflight",
     "save_manifest_csv",
     "scan_dataset_directory",
     "summarize_manifest_audit",

@@ -103,6 +103,29 @@ def verify_release(
             f"Release has {excluded_count} excluded/corrupted image(s) without replacement replanning."
         )
 
+    # Near-duplicate quality gate (strictly separated from exact SHA-256 duplicates)
+    mat_metrics = audit_meta.get("materialization_metrics", {})
+    cross_split_near_dups = int(mat_metrics.get("cross_split_perceptual_candidates", 0))
+    near_dup_gate = str(
+        audit_meta.get("resolved_config", {}).get("near_duplicate_quality_gate", "warn")
+    ).lower()
+    if cross_split_near_dups > 0:
+        if near_dup_gate == "block_publish":
+            checks["near_duplicate_quality_gate"] = False
+            errors.append(
+                f"Near-duplicate quality gate ('block_publish') triggered: "
+                f"{cross_split_near_dups} cross-split perceptual dHash candidate pair(s) detected. "
+                "Review audit_summary.json and record an explicit versioned research decision."
+            )
+        else:
+            checks["near_duplicate_quality_gate"] = True
+            warnings.append(
+                f"Detected {cross_split_near_dups} cross-split perceptual dHash candidate pair(s) "
+                "(not definitive proof of duplication; exact SHA-256 leakage passed)."
+            )
+    else:
+        checks["near_duplicate_quality_gate"] = True
+
     # Verify manifest checksum & load Parquet
     expected_manifest_sha = checksums.get("manifest_parquet", {}).get("sha256")
     manifest_sha_ok = storage.verify_integrity(manifest_key, expected_sha256=expected_manifest_sha)

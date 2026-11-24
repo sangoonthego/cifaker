@@ -21,7 +21,9 @@ prooflens_cache/
 *.7z
 *.rar
 *.parquet
+*.arrow
 *.tar.tmp
+arrow_cache/
 
 # Generated images and plots
 *.bmp

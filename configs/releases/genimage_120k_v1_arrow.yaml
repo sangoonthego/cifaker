@@ -1,0 +1,26 @@
+# Production Release Configuration: genimage-120k-v1 (Frozen Arrow Plan Materialization)
+# Consumes the authoritative frozen 120,000-image selection snapshot from Google Drive (`cifaker`)
+# and retrieves exact original encoded bytes from `nebula/GenImage-arrow@3f4b9f921a673be09a93b335ed728cea0c6ecf33`.
+# Frozen Plan ID: plan_5f4143bb761cac8c (sampling seed 20260401; never re-sampled).
+release_id: "genimage-120k-v1"
+sampling_seed: 20260401
+parent_release_id: null
+description: "Production 120K cross-generator release materialized from frozen Arrow selection snapshot."
+
+source_config: "../sources/genimage_arrow_hf.yaml"
+protocol_config: "../protocols/cross_generator_v1.yaml"
+storage_config: "../storage/google_drive_api.yaml"
+
+frozen_snapshot_prefix: "pipeline_metadata/sampling_freeze/3f4b9f921a673be09a93b335ed728cea0c6ecf33/20261124_131504_857392"
+strict_frozen_mode: true
+near_duplicate_quality_gate: "warn"
+
+# ~1.5 GiB uncompressed TAR shard target
+shard_target_bytes: 1610612736
+materialization_workers: 4
+materialization_batch_size: 256
+source_max_retries: 4
+compute_pixel_hash: false
+compute_perceptual_hash: true
+inventory_batch_size: 5000
+working_dir: "artifacts/pipeline_work"

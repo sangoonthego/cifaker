@@ -1,181 +1,166 @@
 # ProofLens — Scalable GenImage Data Pipeline Guide
 
-This guide documents the production-oriented dataset engineering pipeline built inside `src/prooflens/data/` to construct, verify, publish, scale, and consume versioned GenImage dataset releases (120K → 200K → 500K+ images) across local development, GitHub, Google Colab, and Google Drive (`cifaker`).
+This guide documents the production dataset engineering pipeline inside `src/prooflens/data/`, including **Phase 2: Production Arrow Integration & Frozen Plan Materialization** for the verified sharded Apache Arrow source (`nebula/GenImage-arrow`).
 
 ---
 
-## 1. Architecture Overview
+## 1. Why a Dedicated Arrow Adapter Was Required
 
-```text
-LOCAL DEV & CI (Windows/Linux CPU, synthetic fixtures only)
-  -> Version-controlled Python package (src/prooflens/data/)
-  -> GitHub Repository
-  -> Google Colab Execution Runtime
-     1. Source Inventory     : SourceAdapter -> Bounded-memory Parquet + summary JSON
-     2. Validation & Leakage : SHA-256 / pixel_hash / Band-LSH dHash -> LeakageGuard
-     3. Deterministic Plan   : Nested sampling (Train(120K) ⊆ Train(200K) ⊆ Train(500K))
-                               + Frozen evaluation splits (dev, seen_test, unseen_test)
-     4. Materialization      : Incremental original-byte copy -> Immutable TAR shards + receipts
-     5. Verification Gate    : Checksums, schemas, quotas, zero cross-split leakage, inheritance
-     6. Publication          : Metadata-last `release.json` commit on Google Drive (`cifaker`)
-  -> Dataset Consumer (`load_release`)
-     -> Verifies published release -> Stages/reuses verified TAR shards in Colab local cache
-     -> ShardMapDataset / ShardIterableDataset -> Shared PyTorch DataLoader -> 4 CNN Pipelines
-```
+The Phase 1 pipeline supported extracted directory trees (`DirectoryGenImageAdapter`), ZIP/TAR archives (`ArchiveSourceAdapter`), and generic Hugging Face `datasets` streaming (`HuggingFaceGenImageAdapter`). During Colab acquisition (Cells 1–4.3), the verified upstream source was pinned to:
 
-### Implemented Modules (`src/prooflens/data/`)
+- **Repository:** `nebula/GenImage-arrow` (`https://huggingface.co/datasets/nebula/GenImage-arrow`)
+- **Pinned Revision:** `3f4b9f921a673be09a93b335ed728cea0c6ecf33`
+- **Canonical Source ID:** `genimage_arrow_sharded`
+- **Structure:** 16 partitions across `data/{train,test}/{ADM,BigGAN,glide,Midjourney,stable_diffusion_v_1_4,stable_diffusion_v_1_5,VQDM,wukong}/data-XXXXX-of-YYYYY.arrow` (1,362 total Arrow shards; 76 shards cover the frozen 120,000-image selection).
 
-| Package / Module | Responsibility |
-| :--- | :--- |
-| `config.py` | Validated YAML schemas (`SourceConfig`, `ProtocolConfig`, `StorageConfig`, `ReleaseConfig`), strict unknown-key rejection, and deterministic SHA-256 `config_hash`. |
-| `sources/base.py` | `SourceAdapter` contract, explicit `SourceCapabilities`, `SourceRecord`, `SourceImagePayload`. |
-| `sources/archive.py` | `ArchiveSourceAdapter` for ZIP / TAR / TAR.GZ GenImage distributions using shard-aware single-pass streaming (`iter_selected_images`). |
-| `sources/genimage.py` | `DirectoryGenImageAdapter`, revision-pinned `HuggingFaceGenImageAdapter` (requires explicit `hf_column_mapping`), and `create_source_adapter()`. |
-| `registry/schema.py` | Canonical image schema, Parquet I/O (`pyarrow`), path safety, provenance-derived `image_id`, and strict REAL generator provenance hygiene (`generator="none"` for REAL images vs `source_generator_group`). |
-| `registry/inventory.py` | Streaming batch `ParquetWriter` inventory builder (`O(batch_size)` memory). |
-| `registry/duplicates.py` | Exact SHA-256, optional RGB `pixel_hash`, and Multi-Index Band LSH 64-bit `dHash` near-duplicate candidate generator + Union-Find leakage groups. |
-| `sampling/leakage_guard.py` | Split boundary leakage validator & upstream source-split leakage quarantine/fail guard. |
-| `sampling/stratification.py` | Size-invariant SHA-256 keyed group ranking, balanced generator/class quota distribution, conflict policies, and format/resolution confounding diagnostics. |
-| `sampling/planner.py` | Nested release planner, frozen evaluation splits, dry-run feasibility report, replay verification (`verify_plan_replay`), and explicit replacement planning for exclusions. |
-| `processing/validator.py` | Single-pass raw image bytes validation (Pillow decode, dimensions, format, SHA-256, optional pixel hash & dHash) preserving original bytes untouched. |
-| `processing/shard_writer.py` | Staged immutable uncompressed TAR shard writer with fixed deterministic headers, byte-offset indexing, SHA-256 verification, and per-shard receipts. |
-| `processing/materializer.py` | Bounded-memory incremental materialization with parent shard reuse, per-shard receipt resume, bounded concurrency, retries, and explicit `exclusions.jsonl`. |
-| `storage/base.py`, `local.py`, `google_drive.py` | Replaceable storage abstraction with `LocalFilesystemStorage` and `GoogleDriveStorage` (`api` mode with MD5/size upload verification + `mounted` mode with fsync & read-back SHA-256 verification). |
-| `releases/state.py`, `verifier.py`, `manager.py` | Explicit release lifecycle (`PLANNED -> MATERIALIZING -> MATERIALIZED -> VERIFIED -> PUBLISHED`, plus `FAILED`/`INTERRUPTED`), pre-publish verifier, metadata-last `ReleaseManager`, and read-only `ReleaseConsumer` (`FullLocalShardCache`, `BoundedShardCache`, `load_release`). |
-| `shard_dataset.py` | `ShardMapDataset` (O(1) TAR offset seek) and `ShardIterableDataset` (bounded-disk streaming with disjoint multi-worker sharding and epoch length). |
-| `benchmark.py` | Lightweight stage latency, throughput (img/s, MB/s), and `tracemalloc` peak memory profiler. |
-| `cli.py` | Unified CLI: `python -m prooflens.data.cli {inventory,plan,build,verify,publish,prepare,benchmark}`. |
+The generic `HuggingFaceGenImageAdapter` was insufficient because:
+1. It relied on `datasets.load_dataset(..., streaming=True)` which traverses unrelated partitions rather than downloading only the 76 required Arrow shards.
+2. Train and test Arrow shards have **different schemas** (train includes optional `md5`, `width`, `height`; test contains `image_path`, `image`, `label`, `generator`).
+3. The `image` column stores raw encoded image `binary` bytes directly rather than decoded PIL images or HF Image dicts.
+4. Upstream `generator` is an `int64` column and must NEVER be blindly converted to strings; canonical generator provenance comes from the validated partition directory mapping (`ADM -> adm`, `BigGAN -> biggan`, `glide -> glide`, `Midjourney -> midjourney`, `stable_diffusion_v_1_4 -> sdv4`, `stable_diffusion_v_1_5 -> sdv5`, `VQDM -> vqdm`, `wukong -> wukong`), with `generator="none"` for `REAL` (`0`) images.
+5. Frozen selections use exact Arrow locators (`source_shard`, `source_row_index`, `original_image_path`, `source_path`) that must be preserved verbatim alongside frozen SHA-256 hashes without re-sampling.
 
 ---
 
-## 2. Canonical Data Contracts
+## 2. Architecture & Data Flow (Phase 2)
 
-### Canonical Image Schema (`manifest.parquet`)
-- **Required logical fields:** `image_id`, `source_id`, `source_revision`, `source_path`, `source_split`, `label`, `generator`, `source_generator_group`, `source_shard`, `imagenet_class`, `leakage_group_id`, `eligibility_status`.
-- **Optional metadata fields:** `width`, `height`, `image_format`, `file_size_bytes`, `sha256`, `pixel_hash`, `perceptual_hash`, `decode_status`, `exclusion_reason`.
-- **Release shard columns (in `manifest.parquet`):** `release_split`, `shard_id`, `shard_storage_key`, `shard_member_name`, `shard_offset_data`, `origin_release_id`.
-- **REAL provenance hygiene:** `REAL = 0`, `FAKE = 1`. REAL images MUST carry `generator ∈ {"none", "real", "natural"}` so they are never falsely attributed to a generative model; the paired GenImage subset folder (e.g., `biggan`, `sdv5`) is recorded separately in `source_generator_group`.
-
-### Published Release Layout (in Storage)
-```text
-releases/{release_id}/
-├── state.json                  # Explicit lifecycle state history
-├── plan.json                   # Frozen release plan summary & config_hash
-├── plan_selection.parquet      # Frozen selected image_ids & release_split
-├── shards/{split}/
-│   ├── {shard_id}.tar          # Immutable uncompressed TAR (original image bytes)
-│   └── {shard_id}.receipt.json # Verified per-shard receipt & member byte offsets
-├── manifest.parquet            # Final validated release manifest
-├── checksums.json              # SHA-256 inventory of manifest and all referenced shards
-├── audit_summary.json          # Resolved config, source provenance, duplicate & confounding audit
-└── release.json                # WRITTEN LAST — presence + status=="PUBLISHED" gates consumers
+```mermaid
+flowchart TD
+    FS[Frozen Selection Snapshot on Drive\nfreeze.json + plan.json + plan_selection.parquet + resolved_config.json] --> FPC[Frozen Plan Consumer\nreleases/frozen_plan.py]
+    FPC -->|Validate checksums, quotas, locators, Plan ID| COMPAT[Compatibility Check\nSampling vs Materialization Provenance]
+    COMPAT --> PRE[Storage Capacity Preflight\nreleases/preflight.py]
+    COMPAT --> RM[ReleaseManager\nbuild_from_frozen_snapshot / build_pilot_from_frozen_snapshot]
+    RM --> MAT[Shard-Aware Materializer\nprocessing/materializer.py]
+    MAT -->|Grouped by source_shard + LRU cache| ARROW[GenImageArrowAdapter\nsources/genimage_arrow.py]
+    ARROW -->|hf_hub_download pinned rev| HF[Hugging Face Hub\nnebula/GenImage-arrow@3f4b9f92...]
+    ARROW -->|Original encoded bytes| VAL[Integrity & Frozen SHA-256 Validator\nprocessing/validator.py]
+    VAL -->|Strict failure classification| TAR[Immutable TAR Shard Writer\nprocessing/shard_writer.py]
+    TAR -->|Staged upload + receipt| STORE[StorageBackend\nLocalFilesystemStorage / GoogleDriveStorage]
+    STORE --> VER[Release Verifier\nreleases/verifier.py]
+    VER -->|Metadata-last release.json| PUB[Published Immutable Release]
+    PUB --> CON[ReleaseConsumer / load_release\nShardMapDataset & ShardIterableDataset]
 ```
 
 ---
 
-## 3. Configuration Organization (`configs/`)
+## 3. Canonical Contracts & Source Locator Compatibility
 
-- `configs/sources/`: `genimage_full_archives.yaml`, `genimage_directory.yaml`
-- `configs/protocols/`: `cross_generator_v1.yaml` (6 seen generators, 2 unseen generators, frozen 40K eval suite)
-- `configs/storage/`: `local.yaml`, `google_drive_api.yaml` (folder `cifaker`, ID `1IipfeWX_OVJS2KwaFL5wFlO-edxLoEGD`), `google_drive_mounted.yaml`
-- `configs/releases/`: `genimage_120k_v1.yaml`, `genimage_200k_v1.yaml`, `genimage_500k_v1.yaml`
+### Arrow Source Schema Contract
+- **Mandatory columns:** `image_path` (`string`/`large_string`), `image` (`binary`/`large_binary`), `label` (`int` in `{0, 1}`).
+- **Optional columns:** `md5`, `width`, `height`, `generator`.
+- Both Arrow IPC File (`pyarrow.ipc.open_file`, magic `ARROW1`) and Arrow IPC Stream (`pyarrow.ipc.open_stream`) are read batch-by-batch without converting full tables into Pandas DataFrames.
+
+### Canonical Source Locator Contract
+```text
+source_path = "{shard_filename}/rows/{row_index:08d}/{normalized_original_path}"
+```
+- `source_shard`: e.g., `data/train/ADM/data-00000-of-00099.arrow`
+- `source_row_index`: non-negative `int64` preserved explicitly in `CANONICAL_ARROW_SCHEMA`
+- `original_image_path`: normalized relative path inside the Arrow row
+- `image_id`: unchanged `make_canonical_image_id(source_id, source_revision, source_path)` (`pl_<sha256[:20]>`)
+
+### Original Image Byte Preservation
+- Raw encoded bytes are read verbatim from the Arrow `image` binary column and written verbatim into uncompressed POSIX TAR members.
+- Pillow decodes bytes in memory solely for integrity validation (`LOAD_TRUNCATED_IMAGES = False`), dimension/format inspection, and optional dHash/pixel-hash computation — **never** to re-encode, resize, normalize, or alter stored bytes.
+- Output TAR member extensions use the actual detected image format when the original filename extension is missing or inconsistent.
 
 ---
 
-## 4. Exact CLI Commands
+## 4. Sampling Provenance vs. Materialization Provenance
+
+Because switching source adapters (e.g., to `huggingface_arrow`) or tuning runtime parameters (`working_dir`, `materialization_workers`, `arrow_cache_dir`, `storage`) changes the runtime `config_hash`, ProofLens explicitly separates:
+
+| Provenance Scope | Recorded Fields | Policy |
+| :--- | :--- | :--- |
+| **Sampling Provenance (Immutable)** | `sampling_plan_id`, `sampling_config_hash`, `sampling_code_commit`, `source_id`, `source_revision`, `protocol_version`, `sampling_seed`, `snapshot_location` | **Locked.** Never re-sampled, overwritten, or forged. Verified against `plan_selection.parquet` and `resolved_config.json`. |
+| **Materialization Provenance (Runtime)** | `materialization_config_hash`, `materialization_code_commit`, `materialization_runtime` (Python, PyArrow, adapter type, storage backend, worker count, cache caps) | **Authorized runtime changes** allowed and recorded in `materialization_provenance.json`, `audit_summary.json`, and `release.json`. |
+
+Any mismatch in immutable semantic fields (`source_id`, `source_revision`, `protocol_version`, `seen_generators`, `unseen_generators`, split quotas/rules, `label_mapping`, `sampling_seed`, or official `release_id`) raises `FrozenPlanCompatibilityError`.
+
+---
+
+## 5. Resource Management, Capacity Preflight & Resume Behavior
+
+- **Shard-Aware Scheduling & Bounded Arrow Cache:** Output TAR shard specs sort by `(release_split, source_shard, source_row_index, image_id)`. `GenImageArrowAdapter` caches downloaded `.arrow` shards in a bounded LRU cache (`arrow_max_cached_shards`, `arrow_max_cache_bytes`) and the materializer tracks per-shard remaining reference counts, invoking `adapter.release_source_shard(shard)` as soon as no pending output TAR shards need it.
+- **Read-Only Capacity Preflight (`preflight`):** Computes estimated original image bytes + TAR header/padding (~1 KiB/image) + metadata + in-flight shard retry overhead + local temporary Arrow/TAR staging disk + configurable safety margin (default 15%). When remote Google Drive quota cannot be established, reports `remote_status: "UNKNOWN"` and `overall_status: "REQUIRES_EXPLICIT_APPROVAL"`.
+- **Strict Frozen Failure Classification:** Errors are classified explicitly into `SOURCE_FETCH_FAILURE`, `SOURCE_LOCATOR_MISMATCH`, `SHA256_MISMATCH`, `INVALID_IMAGE_PAYLOAD`, `IMAGE_DECODE_FAILURE`, and `STORAGE_FAILURE`. Under `strict_frozen_mode: true`, any failure logs the exact `image_id`, `source_shard`, and `source_row_index` to `exclusions.jsonl` and halts immediately without silent substitution.
+- **Resume & Idempotency:** Resuming verifies remote shard `.receipt.json` (`status == "COMMITTED"`), exact member ID set, remote byte size, and remote SHA-256, and enforces a `committed_image_ids` guard so no image can ever be committed twice.
+
+---
+
+## 6. Near-Duplicate Audit & Quality Gate
+
+Near-duplicate auditing has **not** yet been completed on the frozen 120,000-image dataset. During materialization, ProofLens computes 64-bit `dHash` (`perceptual_hash`) in the same decode pass and runs Multi-Index Band LSH candidate detection:
+- Exact SHA-256 duplicate evidence is strictly separated from perceptual dHash similarity candidates.
+- Images are **never** silently dropped based on perceptual similarity.
+- `near_duplicate_quality_gate` supports `"warn"` (logs cross-split candidates in `audit_summary.json` and verification warnings) or `"block_publish"` (fails `verify` and blocks publication until an explicit versioned research decision is recorded).
+
+---
+
+## 7. Exact CLI Commands
 
 ```bash
-# 1. Inspect available commands
+# 1. Inspect available CLI commands
 python -m prooflens.data.cli --help
 
-# 2. Build bounded-memory Parquet inventory from upstream source
-python -m prooflens.data.cli inventory --config configs/releases/genimage_120k_v1.yaml
+# 2. Validate frozen snapshot integrity, checksums, quotas, locators, and config compatibility
+python -m prooflens.data.cli validate-frozen \
+  --config configs/releases/genimage_120k_v1_arrow.yaml \
+  --expected-records 120000 \
+  --expected-plan-id plan_5f4143bb761cac8c
 
-# 3. Dry-run release planning & feasibility verification (no image downloads / uploads)
-python -m prooflens.data.cli plan --config configs/releases/genimage_120k_v1.yaml --dry-run
+# 3. Run read-only local + remote storage capacity preflight
+python -m prooflens.data.cli preflight \
+  --config configs/releases/genimage_120k_v1_arrow.yaml
 
-# 4. Materialize immutable TAR shards (resumable & idempotent)
-python -m prooflens.data.cli build --config configs/releases/genimage_120k_v1.yaml --resume
+# 4. Run an isolated bounded pilot (writes ONLY to scratch storage, never official releases/)
+python -m prooflens.data.cli pilot \
+  --config configs/releases/genimage_120k_v1_arrow.yaml \
+  --sample-count 32 \
+  --pilot-storage-dir /content/prooflens_pilot_scratch
 
-# 5. Verify checksums, TAR structure, quotas, leakage, and parent inheritance
-python -m prooflens.data.cli verify --release genimage-120k-v1 --storage-config configs/storage/google_drive_api.yaml
+# 5. Materialize full frozen selection (ONLY after pilot passes and capacity preflight is approved)
+python -m prooflens.data.cli build \
+  --config configs/releases/genimage_120k_v1_arrow.yaml \
+  --strict-frozen \
+  --resume
 
-# 6. Publish immutable release.json last (only succeeds after verify passes)
-python -m prooflens.data.cli publish --release genimage-120k-v1 --storage-config configs/storage/google_drive_api.yaml
+# 6. Verify release checksums, TAR structure, quotas, leakage, and quality gates
+python -m prooflens.data.cli verify \
+  --release genimage-120k-v1 \
+  --storage-config configs/storage/google_drive_api.yaml \
+  --verify-tar-members
 
-# 7. Prepare a published split into local Colab cache (reuses verified cached shards)
-python -m prooflens.data.cli prepare --release genimage-120k-v1 --split train --storage-config configs/storage/google_drive_api.yaml --cache-dir /content/prooflens_cache
+# 7. Publish immutable release.json last
+python -m prooflens.data.cli publish \
+  --release genimage-120k-v1 \
+  --storage-config configs/storage/google_drive_api.yaml
 
-# 8. Profile pipeline throughput and Python heap peak memory
-python -m prooflens.data.cli benchmark --config configs/releases/genimage_120k_v1.yaml
+# 8. Prepare a published split into local Colab cache for CNN training
+python -m prooflens.data.cli prepare \
+  --release genimage-120k-v1 \
+  --split train \
+  --storage-config configs/storage/google_drive_api.yaml \
+  --cache-dir /content/prooflens_cache
 ```
 
 ---
 
-## 5. Dataset Consumption in Model Training (Python API)
+## 8. Future Scaling Compatibility (120K → 200K → 500K+)
 
-Model developers never need access to Full GenImage — only the codebase, Google Drive release access, release ID, and local cache directory:
-
-```python
-from torchvision import transforms
-from prooflens.data import (
-    create_shard_dataloader,
-    create_storage_backend,
-    load_release,
-    load_storage_config,
-)
-
-storage = create_storage_backend(load_storage_config("configs/storage/google_drive_api.yaml"))
-
-# Model-specific preprocessing stays in the training pipeline (never baked into canonical shards)
-model_transform = transforms.Compose(
-    [
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-    ]
-)
-
-train_ds = load_release(
-    release="genimage-120k-v1",
-    split="train",
-    cache_dir="/content/prooflens_cache",
-    storage=storage,
-    transform=model_transform,
-)
-train_loader = create_shard_dataloader(train_ds, batch_size=64, shuffle=True, num_workers=4)
-```
-
-For larger releases (`genimage-500k-v1`) on disk-constrained runtimes, pass `streaming=True, max_cache_bytes=20 * 1024**3` to activate `BoundedShardCache` (LRU shard eviction) with `ShardIterableDataset`.
+The frozen evaluation splits (`dev`, `seen_test`, `unseen_test`) and committed TAR shards from `genimage-120k-v1` remain immutable and reusable as `parent_release_id` for future nested expansions (`genimage-200k-v1`, `genimage-500k-v1`). The frozen snapshot consumer never hardcodes `120,000` and supports any validated release size.
 
 ---
 
-## 6. Scaling Incrementally: 120K → 200K → 500K
+## 9. Testing & Known Cloud Limitations
 
-1. `genimage-200k-v1.yaml` sets `parent_release_id: "genimage-120k-v1"` and overrides `split_quotas.train` from 40K/40K to 80K/80K.
-2. During `plan`, all frozen splits (`dev`, `seen_test`, `unseen_test`) are locked to the parent's exact IDs, and all 80K parent `train` IDs are included first before drawing the next 80K delta images from the exact same deterministic ranked stream (`Train(120K) ⊆ Train(200K) ⊆ Train(500K)`).
-3. During `build`, every committed parent shard is verified and referenced directly (`origin_release_id: "genimage-120k-v1"`). Only the newly selected delta images are read from source and written into new TAR shards.
-4. `genimage-500k-v1` follows the exact same chain with `parent_release_id: "genimage-200k-v1"`.
-
----
-
-## 7. Local Tests vs. Opt-In Colab Real-Data Integration Test
-
-- **Default local test suite (offline, CPU-only, zero credentials):**
+- **Default offline test suite (CPU-only, synthetic Arrow IPC file + stream fixtures, zero network/credentials):**
   ```bash
   python -m pytest -q
   ```
-- **Opt-in real GenImage integration test (run later on Google Colab once Full GenImage is mounted):**
+- **Opt-in bounded real Hugging Face Arrow test (Colab only):**
   ```bash
-  export PROOFLENS_REAL_GENIMAGE_ROOT="/content/genimage_archives"
-  python -m pytest tests/data/test_shards_storage_and_e2e.py -k test_real_genimage_opt_in -s
+  export PROOFLENS_REAL_HF_ARROW_TEST=1
+  python -m pytest tests/data/test_genimage_arrow_and_frozen_plan.py -k test_real_hf_arrow_opt_in -s
   ```
-
----
-
-## 8. Known Limitations & Cloud Integration Notes
-
-- **Google Drive cloud execution is NOT verified locally:** `GoogleDriveStorage` (`api` and `mounted` modes) has been unit-tested offline using mounted filesystem emulation and an in-memory fake Drive v3 service. Real Colab OAuth authentication, Drive API quota/rate-limit behavior, and multi-gigabyte upload speeds must be verified during the first live Colab run.
-- **No cross-file atomic transactions on Google Drive:** Publication relies on a single-writer policy and metadata-last commit (`release.json` uploaded last).
-- **Duplicate audit scope:** Unless `--validate-bytes` is run on the full upstream inventory, exact SHA-256 and perceptual dHash duplicate auditing covers materialized release images only and does NOT prove the entire upstream source is duplicate-free.
-- **Mid-epoch resume:** `ShardIterableDataset` supports deterministic epoch-level shuffling via `set_epoch(epoch)` and disjoint multi-worker sharding, but does NOT implement mid-epoch exact sample resume.
+- **Unverified locally:** Real Hugging Face Hub rate limits/download throughput, real Google Drive shared folder (`1IipfeWX_OVJS2KwaFL5wFlO-edxLoEGD`) quota/upload stability on 24+ GiB of shards, and real 120K near-duplicate audit results must be verified in Colab starting with the bounded pilot.

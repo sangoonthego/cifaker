@@ -329,4 +329,8 @@ def create_source_adapter(config: SourceConfig) -> SourceAdapter:
         return ArchiveSourceAdapter(config)
     if config.source_type == "huggingface":
         return HuggingFaceGenImageAdapter(config)
+    if config.source_type == "huggingface_arrow":
+        from prooflens.data.sources.genimage_arrow import GenImageArrowAdapter
+
+        return GenImageArrowAdapter(config)
     raise ValueError(f"Unsupported source_type: {config.source_type!r}")

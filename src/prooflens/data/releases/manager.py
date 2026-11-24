@@ -26,6 +26,14 @@ from prooflens.data.config import ReleaseConfig
 from prooflens.data.processing.materializer import MaterializationResult, materialize_release
 from prooflens.data.processing.shard_writer import ShardReceipt, compute_file_sha256
 from prooflens.data.registry.schema import read_canonical_parquet, write_canonical_parquet
+from prooflens.data.releases.frozen_plan import (
+    CompatibilityReport,
+    FrozenSnapshot,
+    build_materialization_provenance,
+    build_pilot_selection,
+    check_frozen_plan_compatibility,
+    load_and_validate_frozen_snapshot,
+)
 from prooflens.data.releases.state import ReleaseState, ReleaseStateTracker
 from prooflens.data.releases.verifier import (
     ReleaseVerificationError,
@@ -406,6 +414,475 @@ class ReleaseManager:
 
         return mat_res
 
+    def build_from_frozen_snapshot(
+        self,
+        snapshot: FrozenSnapshot | str | Path,
+        adapter: SourceAdapter,
+        config: ReleaseConfig,
+        snapshot_storage: StorageBackend | None = None,
+        resume: bool = True,
+        strict_frozen_mode: bool = True,
+        expected_total_records: int | None = None,
+    ) -> tuple[MaterializationResult, CompatibilityReport]:
+        """Materialize an externally frozen sampling snapshot without re-running sampling.
+
+        Preserves original `sampling_plan_id`, `sampling_config_hash`, `sampling_code_commit`,
+        and all frozen selection rows while recording `materialization_config_hash`,
+        `materialization_code_commit`, and runtime environment separately.
+        """
+        loaded_snapshot = (
+            snapshot
+            if isinstance(snapshot, FrozenSnapshot)
+            else load_and_validate_frozen_snapshot(
+                snapshot_location=snapshot,
+                storage=snapshot_storage,
+                expected_total_records=expected_total_records,
+            )
+        )
+        compat = check_frozen_plan_compatibility(
+            loaded_snapshot, config, is_pilot=False, raise_on_incompatible=True
+        )
+
+        prefix = f"releases/{config.release_id}"
+        tracker = ReleaseStateTracker(self._storage, config.release_id)
+        sampling_prov = compat.sampling_provenance
+        mat_prov = compat.materialization_provenance
+        sampling_plan_id = str(sampling_prov["sampling_plan_id"])
+        sampling_cfg_hash = str(sampling_prov["sampling_config_hash"])
+
+        if self._storage.is_committed_release(config.release_id):
+            pub_meta = self.load_published_release_metadata(config.release_id)
+            pub_plan_id = pub_meta.get("sampling_plan_id") or pub_meta.get("plan_id")
+            if pub_plan_id != sampling_plan_id:
+                raise ImmutabilityError(
+                    f"Release '{config.release_id}' is already PUBLISHED with plan_id "
+                    f"'{pub_plan_id}', which differs from frozen plan_id '{sampling_plan_id}'."
+                )
+            if resume:
+                _, pub_df, pub_receipts = self._load_parent_artifacts(config.release_id)
+                from prooflens.data.registry.duplicates import DuplicateAuditReport
+
+                dummy_dup = DuplicateAuditReport(
+                    audit_scope="already_published_frozen_idempotent_noop",
+                    total_records_inspected=len(pub_df),
+                    records_with_sha256=int(pub_df["sha256"].notna().sum()),
+                    exact_sha256_duplicate_groups=0,
+                    exact_sha256_duplicate_files=0,
+                    cross_source_split_sha256_groups=0,
+                    cross_label_sha256_groups=0,
+                    pixel_hash_duplicate_groups=0,
+                    perceptual_candidate_pairs=0,
+                    perceptual_included_in_leakage_groups=config.protocol.include_perceptual_in_leakage_groups,
+                    leakage_group_count=int(pub_df["leakage_group_id"].nunique()),
+                    multi_member_leakage_groups=0,
+                    sample_exact_groups=[],
+                    sample_near_duplicate_candidates=[],
+                )
+                return (
+                    MaterializationResult(
+                        release_id=config.release_id,
+                        manifest_df=pub_df,
+                        receipts=pub_receipts,
+                        reused_parent_shards=0,
+                        resumed_existing_shards=len(pub_receipts),
+                        newly_materialized_shards=0,
+                        excluded_records=[],
+                        duplicate_report=dummy_dup,
+                        duration_seconds=0.0,
+                        metrics={"idempotent_published_skip": True},
+                    ),
+                    compat,
+                )
+            raise ImmutabilityError(
+                f"Release '{config.release_id}' is already PUBLISHED; pass --resume for idempotent check."
+            )
+
+        # If resuming an in-progress frozen build, ensure the stored plan matches the exact frozen plan_id
+        plan_key = f"{prefix}/plan.json"
+        sel_key = f"{prefix}/plan_selection.parquet"
+        if resume and self._storage.exists(plan_key):
+            existing_plan = json.loads(self._storage.read_bytes(plan_key).decode("utf-8"))
+            if existing_plan.get("plan_id") != sampling_plan_id:
+                raise ValueError(
+                    f"Cannot resume release '{config.release_id}': existing plan_id "
+                    f"{existing_plan.get('plan_id')!r} != frozen plan_id {sampling_plan_id!r}."
+                )
+        else:
+            # Stage original immutable plan.json & plan_selection.parquet without mutating sampling provenance
+            work_dir = Path(config.working_dir) / config.release_id
+            work_dir.mkdir(parents=True, exist_ok=True)
+            local_plan = work_dir / "plan.json"
+            local_sel = work_dir / "plan_selection.parquet"
+            local_plan.write_text(json.dumps(loaded_snapshot.plan_meta, indent=2), encoding="utf-8")
+            write_canonical_parquet(loaded_snapshot.selection_df, local_sel)
+            self._storage.upload(local_plan, plan_key, overwrite=True)
+            self._storage.upload(local_sel, sel_key, overwrite=True)
+            tracker.transition(
+                ReleaseState.PLANNED,
+                plan_id=sampling_plan_id,
+                config_hash=sampling_cfg_hash,
+                parent_release_id=config.parent_release_id,
+                note="Imported externally frozen sampling plan (no re-sampling).",
+            )
+
+        # Persist separated materialization provenance & compatibility report
+        self._storage.write_bytes(
+            json.dumps(compat.to_dict(), indent=2).encode("utf-8"),
+            f"{prefix}/materialization_provenance.json",
+            overwrite=True,
+        )
+
+        lock_key = f"{prefix}/.writer.lock.json"
+        if config.storage.single_writer_lock:
+            lock_payload = json.dumps(
+                {
+                    "release_id": config.release_id,
+                    "acquired_at_utc": datetime.now(UTC).isoformat(),
+                    "sampling_plan_id": sampling_plan_id,
+                    "materialization_config_hash": mat_prov["materialization_config_hash"],
+                },
+                indent=2,
+            ).encode("utf-8")
+            self._storage.write_bytes(lock_payload, lock_key, overwrite=True)
+
+        tracker.transition(
+            ReleaseState.MATERIALIZING,
+            plan_id=sampling_plan_id,
+            config_hash=sampling_cfg_hash,
+            parent_release_id=config.parent_release_id,
+            note="Frozen plan materialization started.",
+        )
+
+        try:
+            mat_res = materialize_release(
+                selection_df=loaded_snapshot.selection_df,
+                adapter=adapter,
+                storage=self._storage,
+                config=config,
+                parent_receipts=None,
+                parent_manifest_df=None,
+                resume=resume,
+                strict_frozen_mode=strict_frozen_mode,
+            )
+        except KeyboardInterrupt:
+            tracker.transition(
+                ReleaseState.INTERRUPTED,
+                error_message="Interrupted by user or runtime disconnect.",
+                note="Safe to resume with --resume.",
+            )
+            raise
+        except Exception as exc:
+            tracker.transition(
+                ReleaseState.FAILED,
+                error_message=f"{type(exc).__name__}: {exc}",
+                note="Frozen plan materialization failed.",
+            )
+            raise
+        finally:
+            if config.storage.single_writer_lock and not self._storage.is_committed_release(
+                config.release_id
+            ):
+                self._storage.delete_uncommitted(lock_key)
+
+        work_dir = Path(config.working_dir) / config.release_id
+        work_dir.mkdir(parents=True, exist_ok=True)
+        local_manifest = work_dir / "manifest.parquet"
+        write_canonical_parquet(mat_res.manifest_df, local_manifest, require_release_columns=True)
+        manifest_sha = compute_file_sha256(local_manifest)
+        manifest_size = local_manifest.stat().st_size
+
+        self._storage.upload(
+            local_manifest,
+            f"{prefix}/manifest.parquet",
+            expected_sha256=manifest_sha,
+            overwrite=True,
+        )
+
+        shards_dict = {
+            r.shard_id: {
+                "shard_id": r.shard_id,
+                "origin_release_id": r.origin_release_id,
+                "release_split": r.release_split,
+                "storage_key": r.storage_key,
+                "image_count": r.image_count,
+                "byte_size": r.byte_size,
+                "sha256": r.sha256,
+                "created_at_utc": r.created_at_utc,
+            }
+            for r in sorted(mat_res.receipts, key=lambda x: (x.release_split, x.shard_id))
+        }
+
+        checksums_payload = {
+            "release_id": config.release_id,
+            "manifest_parquet": {
+                "storage_key": f"{prefix}/manifest.parquet",
+                "byte_size": manifest_size,
+                "sha256": manifest_sha,
+            },
+            "shards": shards_dict,
+        }
+        self._storage.write_bytes(
+            json.dumps(checksums_payload, indent=2).encode("utf-8"),
+            f"{prefix}/checksums.json",
+            overwrite=True,
+        )
+
+        confounding = analyze_confounding_risks(mat_res.manifest_df)
+        audit_payload = {
+            "release_id": config.release_id,
+            "plan_id": sampling_plan_id,
+            "config_hash": sampling_cfg_hash,
+            "sampling_provenance": sampling_prov,
+            "materialization_provenance": mat_prov,
+            "compatibility_report": compat.to_dict(),
+            "resolved_config": config.to_dict(),
+            "resolved_sampling_config": loaded_snapshot.resolved_sampling_config,
+            "source_provenance": {
+                "source_id": adapter.source_id,
+                "source_revision": adapter.source_revision,
+                "capabilities": adapter.capabilities().to_dict(),
+            },
+            "materialization_metrics": mat_res.metrics,
+            "excluded_count": len(mat_res.excluded_records),
+            "excluded_records_sample": mat_res.excluded_records[:50],
+            "duplicate_audit": mat_res.duplicate_report.to_dict(),
+            "confounding_risks": confounding,
+            "created_at_utc": datetime.now(UTC).isoformat(),
+        }
+        self._storage.write_bytes(
+            json.dumps(audit_payload, indent=2).encode("utf-8"),
+            f"{prefix}/audit_summary.json",
+            overwrite=True,
+        )
+
+        tracker.transition(
+            ReleaseState.MATERIALIZED,
+            plan_id=sampling_plan_id,
+            config_hash=sampling_cfg_hash,
+            parent_release_id=config.parent_release_id,
+            committed_shards=len(mat_res.receipts),
+            total_images=len(mat_res.manifest_df),
+            excluded_images=len(mat_res.excluded_records),
+            note="Frozen plan materialization finished; awaiting verification.",
+        )
+
+        return mat_res, compat
+
+    def build_pilot_from_frozen_snapshot(
+        self,
+        snapshot: FrozenSnapshot | str | Path,
+        adapter: SourceAdapter,
+        config: ReleaseConfig,
+        pilot_storage: StorageBackend,
+        sample_count: int = 32,
+        pilot_seed: int = 42,
+        pilot_cache_dir: Path | str | None = None,
+        snapshot_storage: StorageBackend | None = None,
+    ) -> dict[str, Any]:
+        """Run an isolated bounded pilot materialization into scratch `pilot_storage`.
+
+        Pilot outputs are written exclusively to `pilot_storage` under a `pilot-` release ID
+        with `is_pilot=True, official_release=False` so they can never be mistaken for or
+        pollute an official production dataset release.
+        """
+        loaded_snapshot = (
+            snapshot
+            if isinstance(snapshot, FrozenSnapshot)
+            else load_and_validate_frozen_snapshot(
+                snapshot_location=snapshot,
+                storage=snapshot_storage,
+            )
+        )
+        compat = check_frozen_plan_compatibility(
+            loaded_snapshot, config, is_pilot=True, raise_on_incompatible=True
+        )
+
+        pilot_df = build_pilot_selection(
+            loaded_snapshot, sample_count=sample_count, seed=pilot_seed
+        )
+        pilot_release_id = f"pilot-{config.release_id}-n{len(pilot_df)}-s{pilot_seed}"
+
+        from dataclasses import replace
+
+        pilot_work = str(Path(config.working_dir) / "pilots" / pilot_release_id)
+        pilot_cfg = replace(
+            config,
+            release_id=pilot_release_id,
+            working_dir=pilot_work,
+            strict_frozen_mode=True,
+        )
+
+        mat_res = materialize_release(
+            selection_df=pilot_df,
+            adapter=adapter,
+            storage=pilot_storage,
+            config=pilot_cfg,
+            resume=False,
+            strict_frozen_mode=True,
+        )
+
+        # Build pilot plan metadata matching actual pilot split counts so verifier validates exact pilot quotas
+        pilot_splits_meta: dict[str, Any] = {}
+        for sp_name, grp in pilot_df.groupby("release_split", sort=True):
+            r_cnt = int((grp["label"] == 0).sum())
+            f_cnt = int((grp["label"] == 1).sum())
+            pilot_splits_meta[str(sp_name)] = {
+                "requested_real": r_cnt,
+                "requested_fake": f_cnt,
+                "requested_total": len(grp),
+                "selected_total": len(grp),
+            }
+
+        prefix = f"releases/{pilot_release_id}"
+        pilot_plan_meta = {
+            "is_pilot": True,
+            "official_release": False,
+            "pilot_release_id": pilot_release_id,
+            "source_frozen_plan_id": compat.sampling_provenance["sampling_plan_id"],
+            "source_frozen_release_id": compat.sampling_provenance["release_id"],
+            "plan_id": compat.sampling_provenance["sampling_plan_id"],
+            "release_id": pilot_release_id,
+            "parent_release_id": None,
+            "protocol_version": compat.sampling_provenance["protocol_version"],
+            "sampling_seed": compat.sampling_provenance["sampling_seed"],
+            "splits": pilot_splits_meta,
+        }
+        pilot_storage.write_bytes(
+            json.dumps(pilot_plan_meta, indent=2).encode("utf-8"),
+            f"{prefix}/plan.json",
+            overwrite=True,
+        )
+
+        local_manifest = Path(pilot_work) / pilot_release_id / "manifest.parquet"
+        local_manifest.parent.mkdir(parents=True, exist_ok=True)
+        write_canonical_parquet(mat_res.manifest_df, local_manifest, require_release_columns=True)
+        manifest_sha = compute_file_sha256(local_manifest)
+        manifest_size = local_manifest.stat().st_size
+        pilot_storage.upload(
+            local_manifest,
+            f"{prefix}/manifest.parquet",
+            expected_sha256=manifest_sha,
+            overwrite=True,
+        )
+
+        shards_dict = {
+            r.shard_id: {
+                "shard_id": r.shard_id,
+                "origin_release_id": r.origin_release_id,
+                "release_split": r.release_split,
+                "storage_key": r.storage_key,
+                "image_count": r.image_count,
+                "byte_size": r.byte_size,
+                "sha256": r.sha256,
+                "created_at_utc": r.created_at_utc,
+            }
+            for r in sorted(mat_res.receipts, key=lambda x: (x.release_split, x.shard_id))
+        }
+        pilot_storage.write_bytes(
+            json.dumps(
+                {
+                    "release_id": pilot_release_id,
+                    "is_pilot": True,
+                    "manifest_parquet": {
+                        "storage_key": f"{prefix}/manifest.parquet",
+                        "byte_size": manifest_size,
+                        "sha256": manifest_sha,
+                    },
+                    "shards": shards_dict,
+                },
+                indent=2,
+            ).encode("utf-8"),
+            f"{prefix}/checksums.json",
+            overwrite=True,
+        )
+        pilot_storage.write_bytes(
+            json.dumps(
+                {
+                    "is_pilot": True,
+                    "official_release": False,
+                    "release_id": pilot_release_id,
+                    "sampling_provenance": compat.sampling_provenance,
+                    "materialization_provenance": build_materialization_provenance(pilot_cfg),
+                    "resolved_config": pilot_cfg.to_dict(),
+                    "materialization_metrics": mat_res.metrics,
+                    "excluded_count": len(mat_res.excluded_records),
+                    "duplicate_audit": mat_res.duplicate_report.to_dict(),
+                },
+                indent=2,
+            ).encode("utf-8"),
+            f"{prefix}/audit_summary.json",
+            overwrite=True,
+        )
+
+        ver_report = verify_release(pilot_storage, pilot_release_id, verify_tar_members=True)
+
+        # Read-back verification of every pilot image via TAR byte offsets
+        cache_root = (
+            Path(pilot_cache_dir)
+            if pilot_cache_dir is not None
+            else Path(pilot_work) / "pilot_readback_cache"
+        )
+        readback_verified = 0
+        shard_local_map: dict[str, Path] = {}
+        for sid, sinfo in shards_dict.items():
+            dst = cache_root / f"{sid}.tar"
+            pilot_storage.download(
+                str(sinfo["storage_key"]), dst, expected_sha256=str(sinfo["sha256"])
+            )
+            shard_local_map[sid] = dst
+
+        from prooflens.data.shard_dataset import ShardMapDataset
+
+        ds = ShardMapDataset(
+            manifest_df=mat_res.manifest_df,
+            shard_paths=shard_local_map,
+            transform=None,
+            verify_member_sha256=True,
+        )
+        try:
+            for i in range(len(ds)):
+                sample = ds[i]
+                assert sample["image"].size[0] > 0 and sample["image"].size[1] > 0
+                readback_verified += 1
+        finally:
+            ds.close()
+
+        pilot_report = {
+            "is_pilot": True,
+            "official_release": False,
+            "pilot_release_id": pilot_release_id,
+            "source_frozen_plan_id": compat.sampling_provenance["sampling_plan_id"],
+            "pilot_samples_requested": sample_count,
+            "pilot_samples_materialized": int(len(mat_res.manifest_df)),
+            "pilot_readback_verified": readback_verified,
+            "pilot_real_count": int((mat_res.manifest_df["label"] == 0).sum()),
+            "pilot_fake_count": int((mat_res.manifest_df["label"] == 1).sum()),
+            "pilot_generator_groups": sorted(
+                mat_res.manifest_df["source_generator_group"].astype(str).unique().tolist()
+            ),
+            "pilot_source_splits": sorted(
+                mat_res.manifest_df["source_split"].astype(str).unique().tolist()
+            ),
+            "pilot_release_splits": sorted(
+                mat_res.manifest_df["release_split"].astype(str).unique().tolist()
+            ),
+            "pilot_unique_source_shards": int(
+                mat_res.manifest_df["source_shard"].dropna().nunique()
+            ),
+            "pilot_output_shards": len(mat_res.receipts),
+            "verification": ver_report.to_dict(),
+            "metrics": mat_res.metrics,
+            "sampling_provenance": compat.sampling_provenance,
+            "materialization_provenance": build_materialization_provenance(pilot_cfg),
+            "passed": bool(ver_report.passed and readback_verified == len(pilot_df)),
+        }
+        pilot_storage.write_bytes(
+            json.dumps(pilot_report, indent=2).encode("utf-8"),
+            f"{prefix}/pilot_report.json",
+            overwrite=True,
+        )
+        return pilot_report
+
     def verify(
         self,
         release_id: str,
@@ -483,6 +960,23 @@ class ReleaseManager:
                 ),
             },
             "source_provenance": audit_meta.get("source_provenance", {}),
+            "sampling_provenance": audit_meta.get("sampling_provenance"),
+            "materialization_provenance": audit_meta.get("materialization_provenance"),
+            "sampling_plan_id": (
+                audit_meta.get("sampling_provenance", {}).get("sampling_plan_id")
+                if isinstance(audit_meta.get("sampling_provenance"), dict)
+                else plan_meta.get("plan_id")
+            ),
+            "sampling_config_hash": (
+                audit_meta.get("sampling_provenance", {}).get("sampling_config_hash")
+                if isinstance(audit_meta.get("sampling_provenance"), dict)
+                else audit_meta.get("config_hash")
+            ),
+            "materialization_config_hash": (
+                audit_meta.get("materialization_provenance", {}).get("materialization_config_hash")
+                if isinstance(audit_meta.get("materialization_provenance"), dict)
+                else audit_meta.get("config_hash")
+            ),
             "config_hash": audit_meta.get("config_hash"),
             "resolved_config": resolved_cfg,
             "code_commit_sha": _detect_git_commit_sha(),
