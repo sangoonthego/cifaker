@@ -68,6 +68,21 @@ class StorageObjectMetadata:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class StorageCapacityInfo:
+    """Read-only storage capacity report returned by a StorageBackend."""
+
+    backend_name: str
+    status: str  # "KNOWN" or "UNKNOWN"
+    total_bytes: int | None = None
+    used_bytes: int | None = None
+    free_bytes: int | None = None
+    notes: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 class StorageBackend(ABC):
     """Abstract storage interface supporting local disk, Google Drive, and future cloud stores."""
 
@@ -119,6 +134,14 @@ class StorageBackend(ABC):
     @abstractmethod
     def delete_uncommitted(self, remote_key: str) -> None:
         """Delete an uncommitted/staging object (strictly forbidden on published releases)."""
+
+    def get_capacity_info(self) -> StorageCapacityInfo:
+        """Query read-only remaining storage capacity when supported by the backend."""
+        return StorageCapacityInfo(
+            backend_name=self.backend_name,
+            status="UNKNOWN",
+            notes="Capacity query is not implemented for this storage backend.",
+        )
 
     def is_committed_release(self, release_id: str) -> bool:
         """Return True if `releases/{release_id}/release.json` exists (published release marker)."""

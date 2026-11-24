@@ -1,13 +1,16 @@
 """Command-line interface for the ProofLens scalable dataset pipeline.
 
 Subcommands:
-- `inventory` : Enumerate an upstream source into bounded-memory canonical Parquet + summary JSON.
-- `plan`      : Run deterministic nested sampling & feasibility checks (supports `--dry-run`).
-- `build`     : Materialize immutable verified TAR shards with resume & parent shard reuse.
-- `verify`    : Verify all shards, checksums, schemas, quotas, and leakage boundaries.
-- `publish`   : Publish `release.json` last after verification passes (immutable gate).
-- `prepare`   : Stage verified shards of a published release split into local cache for training.
-- `benchmark` : Profile throughput and Python peak memory on a configured source & storage.
+- `inventory`       : Enumerate an upstream source into bounded-memory canonical Parquet + summary JSON.
+- `plan`            : Run deterministic nested sampling & feasibility checks (supports `--dry-run`).
+- `validate-frozen` : Validate a frozen sampling snapshot and check materialization compatibility.
+- `preflight`       : Run read-only local + remote storage capacity preflight before materialization.
+- `pilot`           : Run a bounded, isolated pilot materialization from a frozen snapshot.
+- `build`           : Materialize immutable verified TAR shards (supports `--frozen-snapshot` & `--resume`).
+- `verify`          : Verify all shards, checksums, schemas, quotas, and leakage boundaries.
+- `publish`         : Publish `release.json` last after verification passes (immutable gate).
+- `prepare`         : Stage verified shards of a published release split into local cache for training.
+- `benchmark`       : Profile throughput and Python peak memory on a configured source & storage.
 
 Invocation:
     python -m prooflens.data.cli <subcommand> [options]
@@ -29,9 +32,14 @@ from prooflens.data.config import (
 )
 from prooflens.data.registry.inventory import build_source_inventory
 from prooflens.data.registry.schema import read_canonical_parquet
+from prooflens.data.releases.frozen_plan import (
+    check_frozen_plan_compatibility,
+    load_and_validate_frozen_snapshot,
+)
 from prooflens.data.releases.manager import ReleaseConsumer, ReleaseManager
+from prooflens.data.releases.preflight import run_capacity_preflight
 from prooflens.data.sources.genimage import create_source_adapter
-from prooflens.data.storage import create_storage_backend
+from prooflens.data.storage import LocalFilesystemStorage, create_storage_backend
 
 
 def _default_inventory_path(working_dir: str, source_id: str, source_revision: str) -> Path:
@@ -115,6 +123,139 @@ def _cmd_plan(args: argparse.Namespace) -> int:
     return 0 if plan.feasible else 2
 
 
+def _resolve_frozen_snapshot_location(args: argparse.Namespace, rel_cfg: Any | None) -> str:
+    loc = getattr(args, "frozen_snapshot", None)
+    if loc:
+        return str(loc)
+    if rel_cfg is not None and rel_cfg.frozen_snapshot_prefix:
+        return str(rel_cfg.frozen_snapshot_prefix)
+    raise ValueError(
+        "Provide --frozen-snapshot <prefix_or_dir> or set 'frozen_snapshot_prefix' in release config."
+    )
+
+
+def _cmd_validate_frozen(args: argparse.Namespace) -> int:
+    rel_cfg = (
+        load_release_config(
+            args.config,
+            source_override=args.source_override,
+            storage_override=args.storage_override,
+            working_dir_override=args.working_dir,
+        )
+        if args.config
+        else None
+    )
+    snapshot_loc = _resolve_frozen_snapshot_location(args, rel_cfg)
+
+    snapshot_storage = None
+    if not args.local:
+        if args.storage_config:
+            snapshot_storage = create_storage_backend(load_storage_config(args.storage_config))
+        elif rel_cfg is not None:
+            snapshot_storage = create_storage_backend(rel_cfg.storage)
+        elif not Path(snapshot_loc).is_dir():
+            raise ValueError(
+                "Provide --local for a local directory snapshot, or --config / --storage-config "
+                "for a remote storage prefix."
+            )
+
+    snapshot = load_and_validate_frozen_snapshot(
+        snapshot_location=snapshot_loc,
+        storage=snapshot_storage,
+        expected_total_records=args.expected_records,
+        expected_source_id=args.expected_source_id,
+        expected_source_revision=args.expected_source_revision,
+        expected_plan_id=args.expected_plan_id,
+    )
+
+    out: dict[str, Any] = {
+        "snapshot_location": snapshot.snapshot_location,
+        "sampling_provenance": snapshot.sampling_provenance,
+        "validation_report": snapshot.validation_report,
+    }
+    if rel_cfg is not None:
+        compat = check_frozen_plan_compatibility(
+            snapshot, rel_cfg, is_pilot=False, raise_on_incompatible=False
+        )
+        out["compatibility"] = compat.to_dict()
+        print(json.dumps(out, indent=2))
+        return 0 if compat.compatible else 2
+
+    print(json.dumps(out, indent=2))
+    return 0
+
+
+def _cmd_preflight(args: argparse.Namespace) -> int:
+    rel_cfg = load_release_config(
+        args.config,
+        source_override=args.source_override,
+        storage_override=args.storage_override,
+        working_dir_override=args.working_dir,
+    )
+    storage = create_storage_backend(rel_cfg.storage)
+
+    snapshot_loc = getattr(args, "frozen_snapshot", None) or rel_cfg.frozen_snapshot_prefix
+    if snapshot_loc:
+        snap_storage = None if args.frozen_snapshot_local else storage
+        snapshot = load_and_validate_frozen_snapshot(
+            snapshot_location=snapshot_loc,
+            storage=snap_storage,
+            expected_total_records=args.expected_records,
+        )
+        check_frozen_plan_compatibility(
+            snapshot, rel_cfg, is_pilot=False, raise_on_incompatible=True
+        )
+        selection_df = snapshot.selection_df
+    else:
+        inv_df = _ensure_inventory_df(args, rel_cfg)
+        adapter = create_source_adapter(rel_cfg.source)
+        manager = ReleaseManager(storage)
+        selection_df = manager.plan(inv_df, rel_cfg, adapter=adapter, dry_run=True).selection_df
+
+    report = run_capacity_preflight(
+        selection_df=selection_df,
+        config=rel_cfg,
+        storage=storage,
+        safety_margin_ratio=args.safety_margin,
+    )
+    print(json.dumps(report.to_dict(), indent=2))
+    if report.overall_status == "FAIL":
+        return 2
+    if report.overall_status == "REQUIRES_EXPLICIT_APPROVAL":
+        return 0 if args.allow_unknown_remote else 4
+    return 0
+
+
+def _cmd_pilot(args: argparse.Namespace) -> int:
+    rel_cfg = load_release_config(
+        args.config,
+        source_override=args.source_override,
+        storage_override=args.storage_override,
+        working_dir_override=args.working_dir,
+    )
+    snapshot_loc = _resolve_frozen_snapshot_location(args, rel_cfg)
+    snap_storage = None if args.frozen_snapshot_local else create_storage_backend(rel_cfg.storage)
+
+    if args.pilot_storage_config:
+        pilot_storage = create_storage_backend(load_storage_config(args.pilot_storage_config))
+    else:
+        pilot_storage = LocalFilesystemStorage(args.pilot_storage_dir)
+
+    adapter = create_source_adapter(rel_cfg.source)
+    manager = ReleaseManager(pilot_storage)
+    report = manager.build_pilot_from_frozen_snapshot(
+        snapshot=snapshot_loc,
+        adapter=adapter,
+        config=rel_cfg,
+        pilot_storage=pilot_storage,
+        sample_count=args.sample_count,
+        pilot_seed=args.pilot_seed,
+        snapshot_storage=snap_storage,
+    )
+    print(json.dumps(report, indent=2))
+    return 0 if report.get("passed") else 1
+
+
 def _cmd_build(args: argparse.Namespace) -> int:
     rel_cfg = load_release_config(
         args.config,
@@ -122,13 +263,45 @@ def _cmd_build(args: argparse.Namespace) -> int:
         storage_override=args.storage_override,
         working_dir_override=args.working_dir,
     )
-    inv_df = _ensure_inventory_df(args, rel_cfg)
     adapter = create_source_adapter(rel_cfg.source)
     storage = create_storage_backend(rel_cfg.storage)
     manager = ReleaseManager(storage)
+
+    snapshot_loc = args.frozen_snapshot or rel_cfg.frozen_snapshot_prefix
+    if snapshot_loc:
+        snap_storage = None if args.frozen_snapshot_local else storage
+        res, compat = manager.build_from_frozen_snapshot(
+            snapshot=snapshot_loc,
+            adapter=adapter,
+            config=rel_cfg,
+            snapshot_storage=snap_storage,
+            resume=args.resume,
+            strict_frozen_mode=True if args.strict_frozen else rel_cfg.strict_frozen_mode,
+            expected_total_records=args.expected_records,
+        )
+        out: dict[str, Any] = {
+            "release_id": res.release_id,
+            "mode": "frozen_snapshot",
+            "sampling_plan_id": compat.sampling_provenance["sampling_plan_id"],
+            "sampling_config_hash": compat.sampling_provenance["sampling_config_hash"],
+            "materialization_config_hash": compat.materialization_provenance[
+                "materialization_config_hash"
+            ],
+            "total_images": len(res.manifest_df),
+            "shard_count": len(res.receipts),
+            "resumed_existing_shards": res.resumed_existing_shards,
+            "newly_materialized_shards": res.newly_materialized_shards,
+            "excluded_count": len(res.excluded_records),
+            "metrics": res.metrics,
+        }
+        print(json.dumps(out, indent=2))
+        return 0 if not res.excluded_records else 3
+
+    inv_df = _ensure_inventory_df(args, rel_cfg)
     res = manager.build(inv_df, adapter=adapter, config=rel_cfg, resume=args.resume)
     out = {
         "release_id": res.release_id,
+        "mode": "standard",
         "total_images": len(res.manifest_df),
         "shard_count": len(res.receipts),
         "reused_parent_shards": res.reused_parent_shards,
@@ -254,6 +427,96 @@ def build_parser() -> argparse.ArgumentParser:
     p_plan.add_argument("--working-dir", type=str, default=None)
     p_plan.set_defaults(func=_cmd_plan)
 
+    # validate-frozen
+    p_vf = sub.add_parser(
+        "validate-frozen",
+        help="Validate an externally frozen sampling snapshot and materialization compatibility.",
+    )
+    p_vf.add_argument(
+        "--frozen-snapshot",
+        type=str,
+        default=None,
+        help="Remote storage prefix or local directory containing freeze.json & plan_selection.parquet.",
+    )
+    p_vf.add_argument(
+        "--local",
+        action="store_true",
+        help="Treat --frozen-snapshot as a local directory rather than a remote storage prefix.",
+    )
+    p_vf.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="Optional release YAML config to check materialization compatibility against.",
+    )
+    p_vf.add_argument("--storage-config", type=Path, default=None, help="Storage YAML config.")
+    p_vf.add_argument("--expected-records", type=int, default=None)
+    p_vf.add_argument("--expected-source-id", type=str, default=None)
+    p_vf.add_argument("--expected-source-revision", type=str, default=None)
+    p_vf.add_argument("--expected-plan-id", type=str, default=None)
+    p_vf.add_argument("--source-override", type=Path, default=None)
+    p_vf.add_argument("--storage-override", type=Path, default=None)
+    p_vf.add_argument("--working-dir", type=str, default=None)
+    p_vf.set_defaults(func=_cmd_validate_frozen)
+
+    # preflight
+    p_pre = sub.add_parser(
+        "preflight",
+        help="Run read-only local and remote storage capacity preflight before materialization.",
+    )
+    p_pre.add_argument("--config", type=Path, required=True, help="Release YAML config.")
+    p_pre.add_argument("--frozen-snapshot", type=str, default=None)
+    p_pre.add_argument("--frozen-snapshot-local", action="store_true")
+    p_pre.add_argument("--inventory", type=Path, default=None)
+    p_pre.add_argument("--expected-records", type=int, default=None)
+    p_pre.add_argument(
+        "--safety-margin",
+        type=float,
+        default=0.15,
+        help="Capacity safety margin ratio (default: 0.15).",
+    )
+    p_pre.add_argument(
+        "--allow-unknown-remote",
+        action="store_true",
+        help="Return exit code 0 (instead of 4) when remote quota is UNKNOWN.",
+    )
+    p_pre.add_argument("--source-override", type=Path, default=None)
+    p_pre.add_argument("--storage-override", type=Path, default=None)
+    p_pre.add_argument("--working-dir", type=str, default=None)
+    p_pre.set_defaults(func=_cmd_preflight)
+
+    # pilot
+    p_pil = sub.add_parser(
+        "pilot",
+        help="Run a bounded, isolated pilot materialization from a frozen snapshot into scratch storage.",
+    )
+    p_pil.add_argument("--config", type=Path, required=True, help="Release YAML config.")
+    p_pil.add_argument("--frozen-snapshot", type=str, default=None)
+    p_pil.add_argument("--frozen-snapshot-local", action="store_true")
+    p_pil.add_argument(
+        "--sample-count",
+        type=int,
+        default=32,
+        help="Number of representative frozen samples to materialize in pilot (default: 32).",
+    )
+    p_pil.add_argument("--pilot-seed", type=int, default=42)
+    p_pil.add_argument(
+        "--pilot-storage-dir",
+        type=Path,
+        default=Path("artifacts/pilot_storage"),
+        help="Isolated local scratch storage for pilot outputs (default: artifacts/pilot_storage).",
+    )
+    p_pil.add_argument(
+        "--pilot-storage-config",
+        type=Path,
+        default=None,
+        help="Optional isolated storage YAML config for pilot outputs.",
+    )
+    p_pil.add_argument("--source-override", type=Path, default=None)
+    p_pil.add_argument("--storage-override", type=Path, default=None)
+    p_pil.add_argument("--working-dir", type=str, default=None)
+    p_pil.set_defaults(func=_cmd_pilot)
+
     # build
     p_build = sub.add_parser(
         "build",
@@ -261,6 +524,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_build.add_argument("--config", type=Path, required=True, help="Path to release YAML config.")
     p_build.add_argument("--inventory", type=Path, default=None, help="Existing inventory Parquet.")
+    p_build.add_argument(
+        "--frozen-snapshot",
+        type=str,
+        default=None,
+        help="Frozen snapshot prefix or directory to materialize without re-running sampling.",
+    )
+    p_build.add_argument(
+        "--frozen-snapshot-local",
+        action="store_true",
+        help="Treat --frozen-snapshot as a local directory rather than a remote storage prefix.",
+    )
+    p_build.add_argument("--expected-records", type=int, default=None)
+    p_build.add_argument(
+        "--strict-frozen",
+        action="store_true",
+        help="Fail immediately on any missing/corrupt/mismatched frozen record.",
+    )
     p_build.add_argument(
         "--resume",
         action="store_true",

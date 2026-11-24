@@ -49,6 +49,10 @@ class SourceRecord:
     file_size_bytes: int | None = None
     file_extension: str = ""
     original_format: str | None = None
+    image_id: str | None = None
+    source_row_index: int | None = None
+    original_image_path: str | None = None
+    expected_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -102,3 +106,10 @@ class SourceAdapter(ABC):
                 yield rec, payload, None
             except Exception as exc:
                 yield rec, None, f"{type(exc).__name__}: {exc}"
+
+    def release_source_shard(self, source_shard: str) -> None:  # noqa: B027
+        """Optional hook called by materializer when no remaining pending outputs need `source_shard`."""
+
+    def runtime_stats(self) -> dict[str, Any]:
+        """Optional runtime statistics (downloads, cache hits/misses, evictions, peak cache bytes)."""
+        return {}

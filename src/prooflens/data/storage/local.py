@@ -9,6 +9,7 @@ from pathlib import Path
 from prooflens.data.storage.base import (
     ImmutabilityError,
     StorageBackend,
+    StorageCapacityInfo,
     StorageError,
     StorageObjectMetadata,
     compute_local_hashes,
@@ -187,3 +188,14 @@ class LocalFilesystemStorage(StorageBackend):
             )
         target = self._resolve_key(norm_key)
         target.unlink(missing_ok=True)
+
+    def get_capacity_info(self) -> StorageCapacityInfo:
+        usage = shutil.disk_usage(self._root)
+        return StorageCapacityInfo(
+            backend_name=self.backend_name,
+            status="KNOWN",
+            total_bytes=int(usage.total),
+            used_bytes=int(usage.used),
+            free_bytes=int(usage.free),
+            notes=f"Local filesystem capacity queried at '{self._root}'.",
+        )

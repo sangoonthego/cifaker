@@ -4,13 +4,17 @@ Features:
 - Reuses verified parent release shards without re-materializing or duplicating existing images.
 - Assigns newly selected (delta) samples deterministically into fixed-size or count-bounded shards.
 - Streams/batches image reads respecting source capabilities (parallel fetch with bounded
-  in-flight window for random-access sources; shard-aware single-pass streaming for archives/HF).
+  in-flight window for random-access sources; shard-aware single-pass streaming for Arrow/archives/HF).
+- Releases finished upstream Arrow source shards proactively once no remaining output shards need them.
 - Retries transient source read errors with exponential backoff.
-- Validates every image's raw bytes, dimensions, format, SHA-256, and optional pixel/perceptual hash.
-- Preserves original bytes verbatim (never resizes, recompresses, or augments).
-- Records per-image exclusions explicitly in `exclusions.jsonl` (never silently substitutes).
-- Resumes cleanly by verifying existing remote/local shard receipts + SHA-256 checksums
-  rather than trusting filename existence alone.
+- Validates every image's raw bytes, dimensions, format, frozen SHA-256 (when present), and
+  optional pixel/perceptual hash without altering original encoded bytes.
+- Distinguishes explicit failure categories (`SOURCE_FETCH_FAILURE`, `SOURCE_LOCATOR_MISMATCH`,
+  `SHA256_MISMATCH`, `INVALID_IMAGE_PAYLOAD`, `IMAGE_DECODE_FAILURE`, `STORAGE_FAILURE`).
+- Supports `strict_frozen_mode=True` to fail immediately on any frozen record failure (never silently
+  skipping or substituting alternative records).
+- Resumes cleanly by verifying existing remote/local shard receipts + SHA-256 checksums and
+  guarding against duplicate image commits across shards.
 """
 
 from __future__ import annotations
@@ -19,7 +23,9 @@ import concurrent.futures
 import hashlib
 import json
 import time
+from collections import Counter
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +42,50 @@ from prooflens.data.registry.duplicates import DuplicateAuditReport, assign_leak
 from prooflens.data.sources.base import SourceAdapter, SourceImagePayload, SourceRecord
 from prooflens.data.storage.base import StorageBackend
 
+_FORMAT_TO_EXTENSION: dict[str, str] = {
+    "JPEG": ".jpg",
+    "JPG": ".jpg",
+    "PNG": ".png",
+    "WEBP": ".webp",
+    "BMP": ".bmp",
+    "TIFF": ".tiff",
+}
+
+_FORMAT_EQUIVALENT_EXTS: dict[str, set[str]] = {
+    "JPEG": {".jpg", ".jpeg"},
+    "PNG": {".png"},
+    "WEBP": {".webp"},
+    "BMP": {".bmp"},
+    "TIFF": {".tif", ".tiff"},
+}
+
+
+class MaterializationFailureCategory(StrEnum):
+    """Explicit failure classification for materialization errors."""
+
+    SOURCE_FETCH_FAILURE = "SOURCE_FETCH_FAILURE"
+    SOURCE_LOCATOR_MISMATCH = "SOURCE_LOCATOR_MISMATCH"
+    SHA256_MISMATCH = "SHA256_MISMATCH"
+    INVALID_IMAGE_PAYLOAD = "INVALID_IMAGE_PAYLOAD"
+    IMAGE_DECODE_FAILURE = "IMAGE_DECODE_FAILURE"
+    STORAGE_FAILURE = "STORAGE_FAILURE"
+
+
+class FrozenMaterializationError(RuntimeError):
+    """Raised in `strict_frozen_mode` when any frozen selected record cannot be materialized."""
+
+    def __init__(
+        self,
+        message: str,
+        image_id: str,
+        category: MaterializationFailureCategory,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.image_id = image_id
+        self.category = category
+        self.details = details or {}
+
 
 @dataclass(frozen=True)
 class PlannedShardSpec:
@@ -46,6 +96,7 @@ class PlannedShardSpec:
     storage_key: str
     receipt_storage_key: str
     image_ids: tuple[str, ...]
+    source_shards: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -76,26 +127,66 @@ def _make_deterministic_shard_id(
     return f"{release_split}-{shard_index:05d}-{digest}"
 
 
+def _classify_error_message(err_msg: str) -> MaterializationFailureCategory:
+    upper = err_msg.upper()
+    if upper.startswith("SHA256_MISMATCH") or "SHA-256 MISMATCH" in upper or "SHA256" in upper:
+        return MaterializationFailureCategory.SHA256_MISMATCH
+    if upper.startswith("SOURCE_LOCATOR_MISMATCH") or "LOCATOR" in upper:
+        return MaterializationFailureCategory.SOURCE_LOCATOR_MISMATCH
+    if (
+        upper.startswith("INVALID_IMAGE_PAYLOAD")
+        or upper.startswith("EMPTY_FILE")
+        or upper.startswith("UNSUPPORTED_EXTENSION")
+        or upper.startswith("INVALID_DIMENSIONS")
+    ):
+        return MaterializationFailureCategory.INVALID_IMAGE_PAYLOAD
+    if upper.startswith("CORRUPTED:") or "DECODE" in upper:
+        return MaterializationFailureCategory.IMAGE_DECODE_FAILURE
+    if upper.startswith("STORAGE_FAILURE"):
+        return MaterializationFailureCategory.STORAGE_FAILURE
+    return MaterializationFailureCategory.SOURCE_FETCH_FAILURE
+
+
+def _resolve_output_extension(original_ext: str, detected_format: str | None) -> str:
+    """Choose output TAR member extension using actual image format when original ext is missing/inconsistent."""
+    clean_orig = original_ext.lower().strip()
+    if clean_orig and not clean_orig.startswith("."):
+        clean_orig = f".{clean_orig}"
+    fmt = (detected_format or "").upper().strip()
+    if fmt in _FORMAT_EQUIVALENT_EXTS:
+        if clean_orig in _FORMAT_EQUIVALENT_EXTS[fmt]:
+            return clean_orig
+        return _FORMAT_TO_EXTENSION[fmt]
+    return clean_orig or ".bin"
+
+
 def plan_deterministic_shards(
     delta_df: pd.DataFrame,
     release_id: str,
     shard_target_bytes: int,
     max_samples_per_shard: int | None = None,
 ) -> list[PlannedShardSpec]:
-    """Partition delta rows deterministically into bounded-size TAR shard specs per split."""
+    """Partition delta rows deterministically into bounded-size TAR shard specs per split.
+
+    Sorting by `(release_split, source_shard, source_row_index, image_id)` groups
+    upstream Arrow/archive rows together to maximize source shard locality while keeping
+    output shard membership 100% deterministic.
+    """
     if delta_df.empty:
         return []
 
     specs: list[PlannedShardSpec] = []
-    # Sort deterministically by release_split, source_shard (for archive locality!), then image_id
     sort_cols = ["release_split"]
     if "source_shard" in delta_df.columns:
         sort_cols.append("source_shard")
+    if "source_row_index" in delta_df.columns and delta_df["source_row_index"].notna().any():
+        sort_cols.append("source_row_index")
     sort_cols.append("image_id")
 
     for split_name, grp in delta_df.groupby("release_split", sort=True):
         ordered = grp.sort_values(by=sort_cols, kind="mergesort")
         current_ids: list[str] = []
+        current_src_shards: set[str] = set()
         current_est_bytes = 0
         shard_idx = 0
 
@@ -119,13 +210,17 @@ def plan_deterministic_shards(
                         storage_key=f"releases/{release_id}/shards/{split_name}/{sid}.tar",
                         receipt_storage_key=f"releases/{release_id}/shards/{split_name}/{sid}.receipt.json",
                         image_ids=tuple(current_ids),
+                        source_shards=tuple(sorted(current_src_shards)),
                     )
                 )
                 shard_idx += 1
                 current_ids = []
+                current_src_shards = set()
                 current_est_bytes = 0
 
             current_ids.append(img_id)
+            if pd.notna(row.get("source_shard")):
+                current_src_shards.add(str(row["source_shard"]))
             current_est_bytes += est_sz
 
         if current_ids:
@@ -137,6 +232,7 @@ def plan_deterministic_shards(
                     storage_key=f"releases/{release_id}/shards/{split_name}/{sid}.tar",
                     receipt_storage_key=f"releases/{release_id}/shards/{split_name}/{sid}.receipt.json",
                     image_ids=tuple(current_ids),
+                    source_shards=tuple(sorted(current_src_shards)),
                 )
             )
 
@@ -145,8 +241,18 @@ def plan_deterministic_shards(
 
 def _row_to_source_record(row: pd.Series) -> SourceRecord:
     src_path = str(row["source_path"])
-    ext = Path(src_path.split("::")[-1]).suffix.lower()
+    orig_path_val = row.get("original_image_path")
+    orig_path = (
+        str(orig_path_val) if pd.notna(orig_path_val) and str(orig_path_val).strip() else None
+    )
+    ext_basis = orig_path or src_path.split("::")[-1]
+    ext = Path(ext_basis).suffix.lower()
+
     raw_sz = row.get("file_size_bytes")
+    raw_row_idx = row.get("source_row_index")
+    raw_sha = row.get("sha256")
+    expected_sha = str(raw_sha).strip() if pd.notna(raw_sha) and str(raw_sha).strip() else None
+
     return SourceRecord(
         source_id=str(row["source_id"]),
         source_revision=str(row["source_revision"]),
@@ -161,6 +267,10 @@ def _row_to_source_record(row: pd.Series) -> SourceRecord:
         ),
         file_size_bytes=int(raw_sz) if pd.notna(raw_sz) else None,
         file_extension=ext,
+        image_id=str(row["image_id"]),
+        source_row_index=int(raw_row_idx) if pd.notna(raw_row_idx) else None,
+        original_image_path=orig_path,
+        expected_sha256=expected_sha,
     )
 
 
@@ -203,12 +313,10 @@ def _try_resume_committed_shard(
     if receipt.shard_id != spec.shard_id or receipt.storage_key != spec.storage_key:
         return None
 
-    # Verify exact member ID set matches deterministic shard plan
     receipt_ids = tuple(m["image_id"] for m in receipt.members)
-    if set(receipt_ids) != set(spec.image_ids):
+    if set(receipt_ids) != set(spec.image_ids) or len(receipt_ids) != len(spec.image_ids):
         return None
 
-    # Verify remote shard integrity (byte size and SHA-256)
     if not storage.verify_integrity(
         spec.storage_key,
         expected_sha256=receipt.sha256,
@@ -219,6 +327,12 @@ def _try_resume_committed_shard(
     return receipt
 
 
+def _append_exclusion_jsonl(path: Path, item: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(item) + "\n")
+
+
 def materialize_release(
     selection_df: pd.DataFrame,
     adapter: SourceAdapter,
@@ -227,17 +341,24 @@ def materialize_release(
     parent_receipts: list[ShardReceipt] | None = None,
     parent_manifest_df: pd.DataFrame | None = None,
     resume: bool = True,
+    strict_frozen_mode: bool | None = None,
 ) -> MaterializationResult:
     """Materialize selected images into immutable verified TAR shards with resume & parent reuse."""
     t0 = time.perf_counter()
+    strict_mode = (
+        bool(strict_frozen_mode) if strict_frozen_mode is not None else config.strict_frozen_mode
+    )
     work_dir = Path(config.working_dir) / config.release_id
     staging_root = work_dir / "staging_shards"
     staging_root.mkdir(parents=True, exist_ok=True)
     exclusions_path = work_dir / "exclusions.jsonl"
+    if exclusions_path.exists():
+        exclusions_path.unlink()
 
     selected_id_set = set(selection_df["image_id"].astype(str).tolist())
     all_receipts: list[ShardReceipt] = []
     reused_image_ids: set[str] = set()
+    committed_image_ids: set[str] = set()
     reused_parent_rows: list[pd.DataFrame] = []
     reused_parent_shards = 0
 
@@ -248,7 +369,6 @@ def materialize_release(
             member_ids = [m["image_id"] for m in p_rec.members]
             if not member_ids or not set(member_ids).issubset(selected_id_set):
                 continue
-            # Verify parent shard still intact in storage before trusting it
             if not storage.verify_integrity(
                 p_rec.storage_key,
                 expected_sha256=p_rec.sha256,
@@ -272,6 +392,7 @@ def materialize_release(
             )
             all_receipts.append(reused_receipt)
             reused_image_ids.update(member_ids)
+            committed_image_ids.update(member_ids)
             reused_parent_rows.append(parent_by_id.loc[member_ids].copy())
             reused_parent_shards += 1
 
@@ -283,6 +404,13 @@ def materialize_release(
         shard_target_bytes=config.shard_target_bytes,
         max_samples_per_shard=config.max_samples_per_shard,
     )
+
+    # Track remaining pending references to each upstream source_shard so Arrow shards
+    # can be proactively released from local disk as soon as they are no longer needed.
+    remaining_src_shard_uses: Counter[str] = Counter()
+    for sp in shard_specs:
+        for src_sh in sp.source_shards:
+            remaining_src_shard_uses[src_sh] += 1
 
     caps = adapter.capabilities()
     delta_indexed = delta_df.set_index("image_id", drop=False)
@@ -302,6 +430,13 @@ def materialize_release(
         if resume:
             resumed_receipt = _try_resume_committed_shard(spec, storage, split_stage_dir)
             if resumed_receipt is not None:
+                overlap = committed_image_ids & set(spec.image_ids)
+                if overlap:
+                    raise RuntimeError(
+                        f"Duplicate image commit detected during resume for shard '{spec.shard_id}': "
+                        f"{sorted(overlap)[:5]}"
+                    )
+                committed_image_ids.update(spec.image_ids)
                 all_receipts.append(resumed_receipt)
                 resumed_existing_shards += 1
                 for m in resumed_receipt.members:
@@ -322,7 +457,19 @@ def materialize_release(
                         }
                     )
                     materialized_rows.append(base_row)
+                for src_sh in spec.source_shards:
+                    remaining_src_shard_uses[src_sh] -= 1
+                    if remaining_src_shard_uses[src_sh] <= 0:
+                        adapter.release_source_shard(src_sh)
                 continue
+
+        # Guard against duplicate commit across shards before opening writer
+        overlap = committed_image_ids & set(spec.image_ids)
+        if overlap:
+            raise RuntimeError(
+                f"Duplicate image_id scheduled across output shards in '{spec.shard_id}': "
+                f"{sorted(overlap)[:5]}"
+            )
 
         # Remove stale local incomplete staging files before fresh shard write
         for stale in (
@@ -356,24 +503,139 @@ def materialize_release(
             payload: SourceImagePayload | None,
             err_msg: str | None,
         ) -> tuple[
-            str, pd.Series, SourceImagePayload | None, ByteValidationResult | None, str | None
+            str,
+            pd.Series,
+            SourceImagePayload | None,
+            ByteValidationResult | None,
+            MaterializationFailureCategory | None,
+            str | None,
         ]:
             if err_msg is not None or payload is None:
-                return img_id, row_series, None, None, err_msg or "EMPTY_PAYLOAD"
+                msg = err_msg or "EMPTY_PAYLOAD"
+                return img_id, row_series, None, None, _classify_error_message(msg), msg
+
+            # Validate image decodability without enforcing filename extension prematurely
+            # (use actual detected image format for extension consistency while preserving raw bytes!)
             vres = validate_image_bytes(
                 raw_bytes=payload.raw_bytes,
-                file_extension=payload.file_extension,
+                file_extension="",
                 supported_extensions=set(config.source.supported_extensions),
                 compute_pixel_hash=config.compute_pixel_hash,
                 compute_perceptual_hash=config.compute_perceptual_hash,
             )
             if not vres.is_valid:
-                return img_id, row_series, None, vres, vres.decode_status
-            return img_id, row_series, payload, vres, None
+                return (
+                    img_id,
+                    row_series,
+                    None,
+                    vres,
+                    _classify_error_message(vres.decode_status),
+                    vres.decode_status,
+                )
+
+            # Strictly verify frozen SHA-256 hash when present in selection (NEVER overwrite mismatch!)
+            frozen_sha_val = row_series.get("sha256")
+            if pd.notna(frozen_sha_val) and str(frozen_sha_val).strip():
+                expected_sha = str(frozen_sha_val).strip()
+                if vres.sha256 != expected_sha:
+                    msg = (
+                        f"SHA256_MISMATCH: Fetched bytes for image_id='{img_id}' have "
+                        f"sha256={vres.sha256}, expected frozen sha256={expected_sha}."
+                    )
+                    return (
+                        img_id,
+                        row_series,
+                        None,
+                        vres,
+                        MaterializationFailureCategory.SHA256_MISMATCH,
+                        msg,
+                    )
+
+            return img_id, row_series, payload, vres, None, None
+
+        def _handle_failure(
+            img_id: str,
+            row_series: pd.Series,
+            category: MaterializationFailureCategory,
+            reason: str,
+            _spec: PlannedShardSpec = spec,
+            _exclusions: list[dict[str, Any]] = shard_exclusions,
+        ) -> None:
+            item = {
+                "image_id": img_id,
+                "release_split": _spec.release_split,
+                "source_path": str(row_series["source_path"]),
+                "source_shard": (
+                    str(row_series["source_shard"])
+                    if pd.notna(row_series.get("source_shard"))
+                    else None
+                ),
+                "source_row_index": (
+                    int(row_series["source_row_index"])
+                    if pd.notna(row_series.get("source_row_index"))
+                    else None
+                ),
+                "failure_category": category.value,
+                "reason": reason,
+            }
+            _exclusions.append(item)
+            _append_exclusion_jsonl(exclusions_path, item)
+            if strict_mode:
+                raise FrozenMaterializationError(
+                    f"Strict frozen materialization failed for image_id='{img_id}' "
+                    f"[{category.value}]: {reason}",
+                    image_id=img_id,
+                    category=category,
+                    details=item,
+                )
+
+        def _record_valid_image(
+            img_id: str,
+            row_series: pd.Series,
+            payload: SourceImagePayload,
+            vres: ByteValidationResult,
+            _spec: PlannedShardSpec = spec,
+            _writer: ImmutableTarShardWriter = writer,
+            _valid_rows: list[dict[str, Any]] = shard_valid_rows,
+        ) -> None:
+            nonlocal images_decoded_total
+            out_ext = _resolve_output_extension(payload.file_extension, vres.image_format)
+            member = _writer.add_image(
+                image_id=img_id,
+                raw_bytes=payload.raw_bytes,
+                file_extension=out_ext,
+                sha256=vres.sha256,
+                label=int(row_series["label"]),
+                generator=str(row_series["generator"]),
+                source_generator_group=str(row_series["source_generator_group"]),
+                source_split=str(row_series["source_split"]),
+                width=vres.width,
+                height=vres.height,
+                image_format=vres.image_format,
+            )
+            images_decoded_total += 1
+            row_dict = row_series.to_dict()
+            row_dict.update(
+                {
+                    "width": vres.width,
+                    "height": vres.height,
+                    "image_format": vres.image_format,
+                    "file_size_bytes": vres.file_size_bytes,
+                    "sha256": vres.sha256,
+                    "pixel_hash": vres.pixel_hash,
+                    "perceptual_hash": vres.perceptual_hash,
+                    "decode_status": "OK",
+                    "shard_id": _spec.shard_id,
+                    "shard_storage_key": _spec.storage_key,
+                    "shard_member_name": member.member_name,
+                    "shard_offset_data": member.offset_data,
+                    "origin_release_id": config.release_id,
+                }
+            )
+            _valid_rows.append(row_dict)
 
         try:
             if caps.random_access and config.materialization_workers > 1:
-                # Bounded-memory batched concurrency: process at most `materialization_batch_size` at once
                 batch_sz = config.materialization_batch_size
                 for start in range(0, len(source_records), batch_sz):
                     batch_recs = source_records[start : start + batch_sz]
@@ -387,6 +649,7 @@ def materialize_release(
                         pd.Series,
                         SourceImagePayload | None,
                         ByteValidationResult | None,
+                        MaterializationFailureCategory | None,
                         str | None,
                     ]:
                         iid, srec = item
@@ -403,99 +666,32 @@ def materialize_release(
                             )
                         )
 
-                    # Deterministic insertion order preserved by pool.map
-                    for iid, row_s, payload, vres, err in batch_results:
+                    for iid, row_s, payload, vres, cat, err in batch_results:
                         if err is not None or payload is None or vres is None:
-                            shard_exclusions.append(
-                                {
-                                    "image_id": iid,
-                                    "release_split": spec.release_split,
-                                    "source_path": str(row_s["source_path"]),
-                                    "reason": err or "UNKNOWN_ERROR",
-                                }
+                            _handle_failure(
+                                iid,
+                                row_s,
+                                cat or MaterializationFailureCategory.SOURCE_FETCH_FAILURE,
+                                err or "UNKNOWN_ERROR",
                             )
                             continue
-                        member = writer.add_image(
-                            image_id=iid,
-                            raw_bytes=payload.raw_bytes,
-                            file_extension=payload.file_extension,
-                            sha256=vres.sha256,
-                            label=int(row_s["label"]),
-                            generator=str(row_s["generator"]),
-                            source_generator_group=str(row_s["source_generator_group"]),
-                            source_split=str(row_s["source_split"]),
-                            width=vres.width,
-                            height=vres.height,
-                            image_format=vres.image_format,
-                        )
-                        images_decoded_total += 1
-                        row_dict = row_s.to_dict()
-                        row_dict.update(
-                            {
-                                "width": vres.width,
-                                "height": vres.height,
-                                "image_format": vres.image_format,
-                                "file_size_bytes": vres.file_size_bytes,
-                                "sha256": vres.sha256,
-                                "pixel_hash": vres.pixel_hash,
-                                "perceptual_hash": vres.perceptual_hash,
-                                "decode_status": "OK",
-                                "shard_id": spec.shard_id,
-                                "shard_storage_key": spec.storage_key,
-                                "shard_member_name": member.member_name,
-                                "shard_offset_data": member.offset_data,
-                                "origin_release_id": config.release_id,
-                            }
-                        )
-                        shard_valid_rows.append(row_dict)
+                        _record_valid_image(iid, row_s, payload, vres)
             else:
-                # Shard-aware sequential streaming path (for TAR/TAR.GZ archives & HuggingFace)
+                # Shard-aware sequential streaming path (Arrow shards, TAR/ZIP archives, HF streaming)
                 for srec, payload, err in adapter.iter_selected_images(source_records):
                     iid, row_s = rec_by_path[srec.source_path]
-                    _, _, valid_payload, vres, val_err = _process_payload(iid, row_s, payload, err)
+                    _, _, valid_payload, vres, cat, val_err = _process_payload(
+                        iid, row_s, payload, err
+                    )
                     if val_err is not None or valid_payload is None or vres is None:
-                        shard_exclusions.append(
-                            {
-                                "image_id": iid,
-                                "release_split": spec.release_split,
-                                "source_path": str(row_s["source_path"]),
-                                "reason": val_err or "UNKNOWN_ERROR",
-                            }
+                        _handle_failure(
+                            iid,
+                            row_s,
+                            cat or MaterializationFailureCategory.SOURCE_FETCH_FAILURE,
+                            val_err or "UNKNOWN_ERROR",
                         )
                         continue
-                    member = writer.add_image(
-                        image_id=iid,
-                        raw_bytes=valid_payload.raw_bytes,
-                        file_extension=valid_payload.file_extension,
-                        sha256=vres.sha256,
-                        label=int(row_s["label"]),
-                        generator=str(row_s["generator"]),
-                        source_generator_group=str(row_s["source_generator_group"]),
-                        source_split=str(row_s["source_split"]),
-                        width=vres.width,
-                        height=vres.height,
-                        image_format=vres.image_format,
-                    )
-                    images_decoded_total += 1
-                    row_dict = row_s.to_dict()
-                    row_dict.update(
-                        {
-                            "width": vres.width,
-                            "height": vres.height,
-                            "image_format": vres.image_format,
-                            "file_size_bytes": vres.file_size_bytes,
-                            "sha256": vres.sha256,
-                            "pixel_hash": vres.pixel_hash,
-                            "perceptual_hash": vres.perceptual_hash,
-                            "decode_status": "OK",
-                            "shard_id": spec.shard_id,
-                            "shard_storage_key": spec.storage_key,
-                            "shard_member_name": member.member_name,
-                            "shard_offset_data": member.offset_data,
-                            "origin_release_id": config.release_id,
-                        }
-                    )
-                    shard_valid_rows.append(row_dict)
+                    _record_valid_image(iid, row_s, valid_payload, vres)
 
             excluded_records.extend(shard_exclusions)
 
@@ -518,28 +714,34 @@ def materialize_release(
                 raise RuntimeError(f"Post-finalize verification failed: {verify_msg}")
 
             # Clean up any partial/corrupt uncommitted remote artifacts from a prior interrupted run.
-            # Note: storage.delete_uncommitted strictly raises ImmutabilityError on PUBLISHED releases.
-            if storage.exists(spec.storage_key):
-                storage.delete_uncommitted(spec.storage_key)
-            if storage.exists(spec.receipt_storage_key):
-                storage.delete_uncommitted(spec.receipt_storage_key)
+            try:
+                if storage.exists(spec.storage_key):
+                    storage.delete_uncommitted(spec.storage_key)
+                if storage.exists(spec.receipt_storage_key):
+                    storage.delete_uncommitted(spec.receipt_storage_key)
 
-            # Upload immutable shard first, then receipt (receipt signals committed shard)
-            storage.upload(
-                local_path=tar_path,
-                remote_key=spec.storage_key,
-                expected_sha256=receipt.sha256,
-                overwrite=False,
-            )
-            storage.upload(
-                local_path=receipt_path,
-                remote_key=spec.receipt_storage_key,
-                overwrite=False,
-            )
+                # Upload immutable shard first, then receipt (receipt signals committed shard)
+                storage.upload(
+                    local_path=tar_path,
+                    remote_key=spec.storage_key,
+                    expected_sha256=receipt.sha256,
+                    overwrite=False,
+                )
+                storage.upload(
+                    local_path=receipt_path,
+                    remote_key=spec.receipt_storage_key,
+                    overwrite=False,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"{MaterializationFailureCategory.STORAGE_FAILURE.value}: "
+                    f"Failed uploading shard '{spec.shard_id}': {type(exc).__name__}: {exc}"
+                ) from exc
 
             bytes_written_total += receipt.byte_size
             newly_materialized_shards += 1
             all_receipts.append(receipt)
+            committed_image_ids.update(r["image_id"] for r in shard_valid_rows)
             materialized_rows.extend(shard_valid_rows)
 
             # Free local staging tar once verified & uploaded to keep bounded disk usage
@@ -547,12 +749,11 @@ def materialize_release(
         except Exception:
             writer.abort()
             raise
-
-    # Persist per-image exclusions log explicitly
-    if excluded_records:
-        with exclusions_path.open("w", encoding="utf-8") as handle:
-            for exc_item in excluded_records:
-                handle.write(json.dumps(exc_item) + "\n")
+        finally:
+            for src_sh in spec.source_shards:
+                remaining_src_shard_uses[src_sh] -= 1
+                if remaining_src_shard_uses[src_sh] <= 0:
+                    adapter.release_source_shard(src_sh)
 
     frames: list[pd.DataFrame] = []
     if reused_parent_rows:
@@ -568,7 +769,8 @@ def materialize_release(
     else:
         combined_df = selection_df.iloc[0:0].copy()
 
-    # Re-run exact SHA-256 & perceptual duplicate audit on materialized image bytes
+    # Re-run exact SHA-256 & perceptual near-duplicate candidate audit on materialized image bytes.
+    # Exact duplicates and perceptual similarity candidates are strictly separated in DuplicateAuditReport.
     updated_df, dup_report = assign_leakage_groups(
         combined_df,
         audit_scope="materialized_release_images_only",
@@ -576,6 +778,22 @@ def materialize_release(
         include_perceptual_in_leakage_groups=config.protocol.include_perceptual_in_leakage_groups,
         perceptual_hamming_threshold=config.protocol.perceptual_hamming_threshold,
     )
+
+    # Identify cross-split perceptual near-duplicate candidates explicitly (informational/audit gate)
+    cross_split_near_dups: list[dict[str, Any]] = []
+    if dup_report.sample_near_duplicate_candidates and not updated_df.empty:
+        split_by_id = dict(
+            zip(
+                updated_df["image_id"].astype(str).tolist(),
+                updated_df["release_split"].astype(str).tolist(),
+                strict=True,
+            )
+        )
+        for cand in dup_report.sample_near_duplicate_candidates:
+            sa = split_by_id.get(cand["image_id_a"])
+            sb = split_by_id.get(cand["image_id_b"])
+            if sa and sb and sa != sb:
+                cross_split_near_dups.append({**cand, "split_a": sa, "split_b": sb})
 
     duration = time.perf_counter() - t0
     metrics = {
@@ -590,6 +808,10 @@ def materialize_release(
         "resumed_existing_shards": resumed_existing_shards,
         "newly_materialized_shards": newly_materialized_shards,
         "excluded_count": len(excluded_records),
+        "strict_frozen_mode": strict_mode,
+        "cross_split_perceptual_candidates": len(cross_split_near_dups),
+        "cross_split_perceptual_candidates_sample": cross_split_near_dups[:20],
+        "adapter_runtime_stats": adapter.runtime_stats(),
     }
 
     return MaterializationResult(

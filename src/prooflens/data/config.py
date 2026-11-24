@@ -20,7 +20,9 @@ from typing import Any
 
 import yaml
 
-VALID_SOURCE_TYPES: frozenset[str] = frozenset({"directory", "archive", "huggingface"})
+VALID_SOURCE_TYPES: frozenset[str] = frozenset(
+    {"directory", "archive", "huggingface", "huggingface_arrow"}
+)
 VALID_STORAGE_BACKENDS: frozenset[str] = frozenset({"local", "google_drive"})
 VALID_GROUP_QUOTA_POLICIES: frozenset[str] = frozenset(
     {"exact_or_fail", "skip_oversized_group", "allow_underfill"}
@@ -29,6 +31,7 @@ VALID_CROSS_SPLIT_LEAKAGE_POLICIES: frozenset[str] = frozenset(
     {"fail", "exclude_cross_split_groups"}
 )
 VALID_GDRIVE_MODES: frozenset[str] = frozenset({"api", "mounted"})
+VALID_NEAR_DUP_GATES: frozenset[str] = frozenset({"warn", "block_publish"})
 
 
 class ConfigValidationError(ValueError):
@@ -103,6 +106,14 @@ class SourceConfig:
     hf_column_mapping: dict[str, str] = field(default_factory=dict)
     hf_streaming: bool = True
     estimated_total_bytes: int | None = None
+    arrow_cache_dir: str | None = None
+    arrow_max_cached_shards: int = 2
+    arrow_max_cache_bytes: int | None = None
+    arrow_batch_size: int = 256
+    arrow_download_retries: int = 3
+    arrow_retry_backoff_seconds: float = 1.0
+    hf_token_env_var: str = "HF_TOKEN"
+    arrow_local_root: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -187,9 +198,12 @@ class ReleaseConfig:
     inventory_batch_size: int = 5000
     working_dir: str = "artifacts/pipeline_work"
     description: str = ""
+    frozen_snapshot_prefix: str | None = None
+    strict_frozen_mode: bool = False
+    near_duplicate_quality_gate: str = "warn"
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        base: dict[str, Any] = {
             "release_id": self.release_id,
             "sampling_seed": self.sampling_seed,
             "parent_release_id": self.parent_release_id,
@@ -207,6 +221,13 @@ class ReleaseConfig:
             "protocol": self.protocol.to_dict(),
             "storage": self.storage.to_dict(),
         }
+        if self.frozen_snapshot_prefix is not None:
+            base["frozen_snapshot_prefix"] = self.frozen_snapshot_prefix
+        if self.strict_frozen_mode:
+            base["strict_frozen_mode"] = self.strict_frozen_mode
+        if self.near_duplicate_quality_gate != "warn":
+            base["near_duplicate_quality_gate"] = self.near_duplicate_quality_gate
+        return base
 
     @property
     def config_hash(self) -> str:
@@ -232,6 +253,14 @@ def validate_source_config(raw: dict[str, Any]) -> SourceConfig:
         "hf_column_mapping",
         "hf_streaming",
         "estimated_total_bytes",
+        "arrow_cache_dir",
+        "arrow_max_cached_shards",
+        "arrow_max_cache_bytes",
+        "arrow_batch_size",
+        "arrow_download_retries",
+        "arrow_retry_backoff_seconds",
+        "hf_token_env_var",
+        "arrow_local_root",
     }
     _reject_unknown_keys(body, allowed, "source")
 
@@ -300,6 +329,27 @@ def validate_source_config(raw: dict[str, Any]) -> SourceConfig:
     if not isinstance(hf_col_map, dict):
         raise ConfigValidationError("'source.hf_column_mapping' must be a mapping.")
 
+    arrow_max_shards = int(body.get("arrow_max_cached_shards", 2))
+    if arrow_max_shards < 1:
+        raise ConfigValidationError("'source.arrow_max_cached_shards' must be >= 1.")
+
+    arrow_max_bytes_raw = body.get("arrow_max_cache_bytes")
+    arrow_max_bytes = int(arrow_max_bytes_raw) if arrow_max_bytes_raw is not None else None
+    if arrow_max_bytes is not None and arrow_max_bytes <= 0:
+        raise ConfigValidationError("'source.arrow_max_cache_bytes' must be positive.")
+
+    arrow_batch = int(body.get("arrow_batch_size", 256))
+    if arrow_batch < 1:
+        raise ConfigValidationError("'source.arrow_batch_size' must be >= 1.")
+
+    arrow_retries = int(body.get("arrow_download_retries", 3))
+    if arrow_retries < 1:
+        raise ConfigValidationError("'source.arrow_download_retries' must be >= 1.")
+
+    arrow_backoff = float(body.get("arrow_retry_backoff_seconds", 1.0))
+    if arrow_backoff < 0.0:
+        raise ConfigValidationError("'source.arrow_retry_backoff_seconds' must be >= 0.")
+
     return SourceConfig(
         source_id=source_id,
         source_type=source_type,
@@ -318,6 +368,22 @@ def validate_source_config(raw: dict[str, Any]) -> SourceConfig:
         hf_column_mapping={str(k): str(v) for k, v in hf_col_map.items()},
         hf_streaming=bool(body.get("hf_streaming", True)),
         estimated_total_bytes=est_bytes,
+        arrow_cache_dir=(
+            str(body["arrow_cache_dir"]).strip()
+            if body.get("arrow_cache_dir") is not None
+            else None
+        ),
+        arrow_max_cached_shards=arrow_max_shards,
+        arrow_max_cache_bytes=arrow_max_bytes,
+        arrow_batch_size=arrow_batch,
+        arrow_download_retries=arrow_retries,
+        arrow_retry_backoff_seconds=arrow_backoff,
+        hf_token_env_var=str(body.get("hf_token_env_var", "HF_TOKEN")).strip() or "HF_TOKEN",
+        arrow_local_root=(
+            str(body["arrow_local_root"]).strip()
+            if body.get("arrow_local_root") is not None
+            else None
+        ),
     )
 
 
@@ -583,6 +649,9 @@ def load_release_config(
         "inventory_batch_size",
         "working_dir",
         "description",
+        "frozen_snapshot_prefix",
+        "strict_frozen_mode",
+        "near_duplicate_quality_gate",
     }
     _reject_unknown_keys(raw, allowed, f"release({path.name})")
 
@@ -660,6 +729,21 @@ def load_release_config(
         working_dir_override or raw.get("working_dir", "artifacts/pipeline_work")
     ).strip()
 
+    near_dup_gate = str(raw.get("near_duplicate_quality_gate", "warn")).strip().lower()
+    if near_dup_gate not in VALID_NEAR_DUP_GATES:
+        raise ConfigValidationError(
+            f"Invalid 'near_duplicate_quality_gate': {near_dup_gate!r}. "
+            f"Expected one of {sorted(VALID_NEAR_DUP_GATES)}."
+        )
+
+    frozen_prefix = (
+        str(raw["frozen_snapshot_prefix"]).strip()
+        if raw.get("frozen_snapshot_prefix") is not None
+        else None
+    )
+    if frozen_prefix == "":
+        frozen_prefix = None
+
     return ReleaseConfig(
         release_id=release_id,
         sampling_seed=seed,
@@ -677,4 +761,7 @@ def load_release_config(
         inventory_batch_size=inv_batch,
         working_dir=working_dir,
         description=str(raw.get("description", "")).strip(),
+        frozen_snapshot_prefix=frozen_prefix,
+        strict_frozen_mode=bool(raw.get("strict_frozen_mode", False)),
+        near_duplicate_quality_gate=near_dup_gate,
     )

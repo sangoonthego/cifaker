@@ -34,6 +34,7 @@ from prooflens.data.storage.base import (
     ImmutabilityError,
     StorageAuthenticationError,
     StorageBackend,
+    StorageCapacityInfo,
     StorageError,
     StorageObjectMetadata,
     compute_local_hashes,
@@ -578,4 +579,62 @@ class GoogleDriveStorage(StorageBackend):
             self._retry(
                 f"delete({norm_key})",
                 lambda: service.files().delete(fileId=meta["id"], supportsAllDrives=True).execute(),
+            )
+
+    def get_capacity_info(self) -> StorageCapacityInfo:
+        if self._mode == "mounted":
+            assert self._mount_root is not None
+            if not self._mount_root.exists():
+                return StorageCapacityInfo(
+                    backend_name=self.backend_name,
+                    status="UNKNOWN",
+                    notes=f"Mounted Drive path does not exist: '{self._mount_root}'.",
+                )
+            usage = shutil.disk_usage(self._mount_root)
+            return StorageCapacityInfo(
+                backend_name=self.backend_name,
+                status="KNOWN",
+                total_bytes=int(usage.total),
+                used_bytes=int(usage.used),
+                free_bytes=int(usage.free),
+                notes=(
+                    "Queried via mounted Google Drive FUSE statvfs. Note that FUSE reported "
+                    "free space may differ from shared folder owner quota."
+                ),
+            )
+
+        try:
+            service = self._get_service()
+            about = service.about().get(fields="storageQuota").execute()
+            quota = about.get("storageQuota", {})
+            limit_raw = quota.get("limit")
+            usage_raw = quota.get("usage")
+            if limit_raw is None or usage_raw is None:
+                return StorageCapacityInfo(
+                    backend_name=self.backend_name,
+                    status="UNKNOWN",
+                    used_bytes=int(usage_raw) if usage_raw is not None else None,
+                    notes=(
+                        "Google Drive API storageQuota did not report a finite 'limit' "
+                        "(e.g., workspace/shared drive quota); explicit operator approval required."
+                    ),
+                )
+            limit_b = int(limit_raw)
+            used_b = int(usage_raw)
+            return StorageCapacityInfo(
+                backend_name=self.backend_name,
+                status="KNOWN",
+                total_bytes=limit_b,
+                used_bytes=used_b,
+                free_bytes=max(0, limit_b - used_b),
+                notes=(
+                    "Queried via Google Drive API v3 about.storageQuota for the authenticated "
+                    "account (verify shared folder owner quota independently if uploading to a shared folder)."
+                ),
+            )
+        except Exception as exc:
+            return StorageCapacityInfo(
+                backend_name=self.backend_name,
+                status="UNKNOWN",
+                notes=f"Unable to query Google Drive API storageQuota ({type(exc).__name__}): {exc}",
             )

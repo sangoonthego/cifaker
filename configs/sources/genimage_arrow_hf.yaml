@@ -1,0 +1,45 @@
+# Verified Sharded Apache Arrow Source Configuration (Hugging Face Hub)
+# Upstream dataset: https://huggingface.co/datasets/nebula/GenImage-arrow
+# Pinned immutable commit SHA verified during Colab acquisition (Cells 1-4.3).
+# Optional HF authentication is resolved via environment variable `HF_TOKEN` (never embed tokens).
+source:
+  source_id: "genimage_arrow_sharded"
+  source_type: "huggingface_arrow"
+  source_revision: "3f4b9f921a673be09a93b335ed728cea0c6ecf33"
+  location: "nebula/GenImage-arrow"
+  real_generator_value: "none"
+  strict_generator_mapping: true
+  hf_token_env_var: "HF_TOKEN"
+  arrow_cache_dir: "artifacts/arrow_cache"
+  arrow_max_cached_shards: 2
+  arrow_max_cache_bytes: 2147483648
+  arrow_batch_size: 256
+  arrow_download_retries: 4
+  arrow_retry_backoff_seconds: 1.5
+  label_mapping:
+    nature: 0
+    real: 0
+    ai: 1
+    fake: 1
+  split_mapping:
+    train: "train"
+    val: "val"
+    valid: "val"
+    test: "test"
+  generator_mapping:
+    ADM: "adm"
+    BigGAN: "biggan"
+    glide: "glide"
+    Midjourney: "midjourney"
+    stable_diffusion_v_1_4: "sdv4"
+    stable_diffusion_v_1_5: "sdv5"
+    VQDM: "vqdm"
+    wukong: "wukong"
+  supported_extensions:
+    - ".png"
+    - ".jpg"
+    - ".jpeg"
+    - ".webp"
+    - ".bmp"
+    - ".tiff"
+    - ".tif"
